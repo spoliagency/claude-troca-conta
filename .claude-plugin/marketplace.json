@@ -1,0 +1,14 @@
+{
+  "name": "spoli-ferramentas",
+  "description": "Ferramentas da Spoli Agency para o Claude Code.",
+  "owner": {
+    "name": "Spoli Agency"
+  },
+  "plugins": [
+    {
+      "name": "troca-conta",
+      "source": "./",
+      "description": "Troca de conta do Claude Code ao bater o limite, com retomada automatica da sessao."
+    }
+  ]
+}

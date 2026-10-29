@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "StopFailure": [
+      {
+        "matcher": "rate_limit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/trocar-conta.js\" trocar --hook",
+            "timeout": 21000,
+            "asyncRewake": true
+          }
+        ]
+      }
+    ]
+  }
+}

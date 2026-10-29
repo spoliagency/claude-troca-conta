@@ -1,0 +1,8 @@
+node_modules/
+*.log
+*.tmp-*
+# nunca versionar login: a pasta de contas guardadas vive em ~/.claude/contas, fora do repo, mas por garantia
+contas/
+.credentials.json
+.claude.json
+*.flag
