@@ -12,7 +12,7 @@ const http = require('http');
 const assert = require('assert');
 const { spawn, spawnSync } = require('child_process');
 
-const REPO = path.resolve(__dirname, '..', '..');
+const REPO = process.env.E2E_REPO || path.resolve(__dirname, '..', '..'); // E2E_REPO=spoliagency/claude-troca-conta testa a instalacao pelo GitHub
 const CLAUDE = process.env.E2E_CLAUDE || 'claude';
 const SHELL = process.platform === 'win32' && !/\.exe$/i.test(CLAUDE);
 const base = path.join(os.tmpdir(), `e2e lembrete ${process.pid}`);

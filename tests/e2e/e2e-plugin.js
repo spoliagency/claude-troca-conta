@@ -20,7 +20,7 @@ const http = require('http');
 const assert = require('assert');
 const { spawn, spawnSync } = require('child_process');
 
-const REPO = path.resolve(__dirname, '..', '..');
+const REPO = process.env.E2E_REPO || path.resolve(__dirname, '..', '..'); // E2E_REPO=spoliagency/claude-troca-conta testa a instalacao pelo GitHub
 const CLAUDE = process.env.E2E_CLAUDE || 'claude';
 const SHELL = process.platform === 'win32' && !/\.exe$/i.test(CLAUDE);
 const TMP = os.tmpdir(); // as pastas do teste ("e2e troca conta", "config dir") ja levam espaco, como num usuario "Nome Sobrenome"
