@@ -86,6 +86,20 @@ test('duas esperas ao mesmo tempo (usuaria digitou de novo): so uma acorda', asy
   assert.equal(w.quem(), 'b@x.com');
 });
 
+test('quatro esperas acordando NO MESMO INSTANTE (5 rodadas): exatamente uma acorda, sempre', async (t) => {
+  for (let rodada = 1; rodada <= 5; rodada++) {
+    const w = duasContas(); t.after(w.limpar);
+    w.hook(LONGE, 's1'); // B -> A
+    soltarTrava(w);
+    w.mudarEstado((e) => { e['b@x.com'] = { limiteAte: new Date(Date.now() + 1800).toISOString() }; });
+    const rs = await Promise.all([1, 2, 3, 4].map(() => w.hookAsync(LONGE, 's1', RAPIDO)));
+    const acordaram = rs.filter((r) => r.status === 2).length;
+    assert.equal(acordaram, 1, `rodada ${rodada}: ${rs.map((r) => r.status).join('/')} (so uma pode acordar a sessao)`);
+    assert.equal(w.quem(), 'b@x.com');
+    assert.equal((w.log().match(/VOLTOU/g) || []).length, 1, 'uma unica retomada no log');
+  }
+});
+
 test('tres contas: pula a que esta no limite e escolhe a livre', (t) => {
   const w = criarMundo(); t.after(w.limpar);
   for (const [e, k] of [['a@x.com', 'A'], ['b@x.com', 'B'], ['c@x.com', 'C']]) { w.logar(e, k); w.run(['salvar']); } // ativa: C

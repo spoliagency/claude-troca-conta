@@ -1,10 +1,10 @@
 {
   "name": "claude-troca-conta",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Plugin do Claude Code: troca de conta ao bater o limite, com retomada automatica.",
   "scripts": {
-    "test": "node --test tests/reset.test.js tests/fluxo.test.js tests/keychain.test.js",
+    "test": "node --test tests/reset.test.js tests/fluxo.test.js tests/keychain.test.js tests/guia.test.js",
     "e2e": "node tests/e2e/e2e-plugin.js",
     "validar": "claude plugin validate . --strict"
   },

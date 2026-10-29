@@ -8,8 +8,11 @@
 // nao e tocado.
 //
 // Uso (veja README.md):
+//   guia                       onde voce esta no cadastro e qual o proximo passo (lido do estado real)
 //   salvar                     guarda a conta logada agora
+//   ensaio                     troca para cada outra conta e volta, conferindo (prova que funciona)
 //   status                     contas guardadas, a ativa e os limites
+//   lembrete                   aviso de inicio de sessao (hook SessionStart), mudo quando esta tudo certo
 //   trocar [email] [--dry]     troca de conta agora (manual)
 //   trocar --hook              modo hook StopFailure/rate_limit (le o JSON do stdin)
 //   diagnosticar               confere o ambiente, sem alterar nada
@@ -34,7 +37,7 @@ const ANTI_PINGPONG_MS = 60 * 1000;
 const RETOMAR = 'Retome exatamente de onde parou, sem pedir confirmacao e sem repetir o que ja foi feito.';
 
 function lerOpcional(f) { try { return lerJson(f); } catch { return {}; } }
-function config() { return { esperar: true, maxEsperaHoras: 5.5, mac: false, ...lerOpcional(P.config) }; }
+function config() { return { esperar: true, maxEsperaHoras: 5.5, mac: false, lembrete: true, ...lerOpcional(P.config) }; }
 const CFG = config();
 
 // Variaveis de ambiente existem pra teste (relogio acelerado); o uso normal vem do config.json.
@@ -81,7 +84,7 @@ function acordar(texto) {
   setTimeout(() => process.exit(2), ACORDAR_MS);
 }
 
-function aplicar(a, alvo, st, sessao) {
+function aplicar(a, alvo, st, sessao, motivo = 'manual') {
   guardar(a); // o token pode ter sido renovado desde o ultimo "salvar"
   const credAntes = a.store.ler();
   const cred = JSON.parse(JSON.stringify(credAntes));
@@ -105,6 +108,7 @@ function aplicar(a, alvo, st, sessao) {
   }
   st._ultimaTroca = Date.now();
   st._sessao = sessao;
+  st._ultima = { de: a.email, para: alvo.email, em: new Date().toISOString(), motivo };
   gravar(P.estado, st);
 }
 
@@ -119,12 +123,29 @@ function aguardar(volta, sessao, inicio) {
   }, POLL_MS);
 }
 
-function retomar(sessao, inicio) {
+// Trava de arquivo: duas esperas que acordam no mesmo instante leem o estado antes de qualquer uma gravar,
+// e as duas trocariam e acordariam a sessao. Criar o arquivo com "wx" e atomico: so uma passa.
+const TRAVA = path.join(P.dir, 'retomada.lock');
+function pegarTrava() {
+  try {
+    fs.mkdirSync(P.dir, { recursive: true });
+    const fd = fs.openSync(TRAVA, 'wx');
+    fs.closeSync(fd);
+    return true;
+  } catch {
+    try { if (Date.now() - fs.statSync(TRAVA).mtimeMs > 60000) { fs.unlinkSync(TRAVA); return pegarTrava(); } } catch { /* sumiu: tenta de novo na proxima volta */ }
+    return false;
+  }
+}
+const soltarTrava = () => { try { fs.unlinkSync(TRAVA); } catch { /* ja solta */ } };
+
+// Decide e executa a troca da retomada com a trava na mao. Devolve o que fazer depois de soltar a trava.
+function decidirRetomada(sessao, inicio) {
   const a = atual();
   const st = estado();
   const agora = Date.now();
   // Outro hook (outra espera, outra sessao) ja trocou/retomou depois que comecei a esperar.
-  if (st._ultimaTroca && st._ultimaTroca > inicio) { log('espera encerrada: ja foi retomado por outro hook'); process.exit(0); }
+  if (st._ultimaTroca && st._ultimaTroca > inicio) return { sair: 'espera encerrada: ja foi retomado por outro hook' };
 
   const todas = contasGuardadas().filter((s) => !precisaLogin(s) || s.email === a.email);
   const livres = todas.filter((s) => !limitada(st, s.email, agora));
@@ -133,16 +154,25 @@ function retomar(sessao, inicio) {
     const marcadas = todas.filter((s) => st[s.email] && st[s.email].limiteAte).map((s) => s.email);
     if (marcadas.length) {
       const prox = proximaVolta(st, marcadas);
-      if (prox - agora <= MAX_ESPERA_MS) return aguardar(prox, sessao, inicio);
+      if (prox - agora <= MAX_ESPERA_MS) return { esperar: prox };
     }
-    log('espera desistiu: proxima volta longe demais'); process.exit(0);
+    return { sair: 'espera desistiu: proxima volta longe demais' };
   }
-  if (alvo.email !== a.email) aplicar(a, alvo, st, sessao);
+  if (alvo.email !== a.email) aplicar(a, alvo, st, sessao, 'renovado');
   else { st._ultimaTroca = agora; st._sessao = sessao; gravar(P.estado, st); }
+  return { de: a.email, para: alvo.email };
+}
 
-  log(`VOLTOU (limite renovado): ${a.email} -> ${alvo.email}`);
-  avisar(`Claude voltou para ${alvo.email}`, 'Limite renovado. Retomando sozinho.');
-  acordar(`[troca-conta] o limite foi renovado; a sessao esta na conta ${alvo.email}. ${RETOMAR}`);
+function retomar(sessao, inicio) {
+  if (!pegarTrava()) { log('espera encerrada: outra espera esta retomando agora'); process.exit(0); }
+  let r;
+  try { r = decidirRetomada(sessao, inicio); } finally { soltarTrava(); }
+  if (r.sair) { log(r.sair); process.exit(0); }
+  if (r.esperar) return aguardar(r.esperar, sessao, inicio);
+
+  log(`VOLTOU (limite renovado): ${r.de} -> ${r.para}`);
+  avisar(`Claude voltou para ${r.para}`, 'Limite renovado. Retomando sozinho.');
+  acordar(`[troca-conta] o limite foi renovado; a sessao esta na conta ${r.para}. ${RETOMAR}`);
 }
 
 function lerStdin() { try { return JSON.parse(fs.readFileSync(0, 'utf8')); } catch { return {}; } }
@@ -205,7 +235,7 @@ function trocar({ hook, dry, para }) {
 
   if (dry) { console.log(`[dry] trocaria ${a.email} -> ${alvo.email}`); return; }
 
-  aplicar(a, alvo, st, entrada.session_id);
+  aplicar(a, alvo, st, entrada.session_id, hook ? 'limite' : 'manual');
   log(`TROCOU (${hook ? 'limite' : 'manual'}): ${a.email} -> ${alvo.email}`);
   if (hook) {
     avisar(`Claude trocou para ${alvo.email}`, `${a.email} bateu o limite. Retomando sozinho.`);
@@ -227,7 +257,133 @@ function status() {
     const login = r ? (precisaLogin(s) ? 'PRECISA DE /login' : `login vale +${dias(r)}d`) : '';
     console.log(`${s.email === ativa ? '*' : ' '} ${s.email}  ${s.claudeAiOauth.subscriptionType || '?'}  ${lim}  ${login}`);
   }
+  const u = st._ultima;
+  if (u && u.motivo !== 'ensaio') console.log(`ultima troca: ${hhmm(u.em)}  ${u.de} -> ${u.para}  (${u.motivo})`);
+  if (st._ensaio) console.log(`ensaio: ${st._ensaio.ok ? 'ok em ' + hhmm(st._ensaio.em) : 'FALHOU: ' + st._ensaio.erro}`);
   console.log(`(* = logada agora) · guardadas em ${P.dir}`);
+}
+
+// Onde a pessoa esta no cadastro, lido do estado REAL (login, contas guardadas, ensaio), nunca da conversa.
+// n = 1..4 e o passo que falta; n = 5 quer dizer pronto.
+function progresso() {
+  let a = null; let erro = null;
+  try { a = atual(); } catch (e) { erro = e.message; }
+  const lista = contasGuardadas();
+  const st = estado();
+  const emails = lista.map((s) => s.email).sort();
+  const vencidas = lista.filter(precisaLogin);
+  const ativaGuardada = !!a && lista.some((s) => s.email === a.email);
+  const ens = st._ensaio;
+  const ensaioOk = !!(ens && ens.ok && JSON.stringify(ens.contas) === JSON.stringify(emails));
+  const ok = [!!a, lista.length >= 1, lista.length >= 2 && !vencidas.length, false];
+  ok[3] = ok[2] && ensaioOk && ativaGuardada;
+  const n = ok.findIndex((x) => !x) + 1 || 5;
+  return { a, erro, lista, st, emails, vencidas, ativaGuardada, ens, ok, n };
+}
+
+function guia() {
+  const g = progresso();
+  const marca = (v, depende) => (v ? '[ok]   ' : depende ? '[falta]' : '[     ]');
+  const nomes = [
+    `1. Login do Claude Code lido${g.a ? ': ' + g.a.email : ''}`,
+    '2. Primeira conta guardada',
+    '3. Segunda conta guardada e com login valido',
+    '4. Troca testada (ensaio)',
+  ];
+  console.log('Passo a passo da troca de conta');
+  nomes.forEach((t, i) => console.log(`${marca(g.ok[i], g.n === i + 1)} ${t}`));
+
+  if (g.n === 5) {
+    const u = g.st._ultima;
+    console.log('ESTADO: PRONTO');
+    console.log('CONTAS: ' + g.lista.map((s) => `${s.email} (${s.claudeAiOauth.subscriptionType || '?'})`).join(', '));
+    console.log(`ENSAIO: ${hhmm(g.ens.em)}, trocou entre ${g.emails.join(' e ')} e voltou, login e identidade conferidos nos dois sentidos`);
+    console.log(u && u.motivo !== 'ensaio'
+      ? `ULTIMA TROCA REAL: ${hhmm(u.em)} ${u.de} -> ${u.para} (${u.motivo})`
+      : 'ULTIMA TROCA REAL: ainda nao houve (so acontece quando uma conta bater o limite)');
+    console.log('AGORA: nada a fazer. Quando uma conta bater o limite a sessao troca e continua sozinha; um aviso do sistema aparece a cada troca.');
+    return;
+  }
+
+  let agora;
+  if (g.n === 1) {
+    agora = /^Mac:/.test(g.erro || '')
+      ? g.erro
+      : `Peca a pessoa para digitar /login e entrar numa conta Claude (login so por chave de API nao serve). Detalhe tecnico: ${g.erro}`;
+  } else if (g.n === 2) {
+    agora = `Rode: salvar   (guarda ${g.a.email}). Depois rode guia de novo.`;
+  } else if (g.n === 3) {
+    if (g.vencidas.length) agora = `${g.vencidas.map((s) => s.email).join(', ')} precisa de /login de novo (o token de renovacao venceu). Peca /login nessa conta e rode: salvar`;
+    else if (!g.ativaGuardada) agora = `A conta ativa (${g.a.email}) ainda nao esta guardada. Rode: salvar   Depois rode guia de novo.`;
+    else agora = `So ha 1 conta guardada (${g.a.email}). Peca a pessoa para digitar /login e entrar na OUTRA conta (nunca /logout). Voce NAO consegue fazer o login por ela. Quando ela avisar que terminou, rode guia de novo.`;
+  } else if (!g.ativaGuardada) {
+    agora = `A conta ativa (${g.a.email}) nao esta entre as guardadas. Rode: salvar   Depois rode guia de novo.`;
+  } else if (g.ens && g.ens.ok === false) {
+    agora = `O ultimo ensaio falhou: ${g.ens.erro}. Rode diagnosticar, resolva o que aparecer como FALHA e rode ensaio de novo.`;
+  } else {
+    agora = 'Explique que o ensaio troca de conta por cerca de 1 segundo e volta (ninguem perde nada), peca um ok e rode: ensaio';
+  }
+  console.log(`ESTADO: PASSO ${g.n} de 4`);
+  console.log('AGORA: ' + agora);
+}
+
+// Prova que a troca funciona NESTA maquina sem esperar um limite de verdade: vai para cada outra conta
+// guardada e volta, conferindo login e identidade lidos de volta nos dois sentidos.
+function ensaio() {
+  const a = atual();
+  const guardadas = contasGuardadas();
+  if (!guardadas.some((s) => s.email === a.email)) throw new Error(`a conta ativa (${a.email}) ainda nao esta guardada; rode "salvar" antes`);
+  const vencidas = guardadas.filter(precisaLogin);
+  if (vencidas.length) throw new Error(`${vencidas.map((s) => s.email).join(', ')} precisa(m) de /login de novo; faca o login nela e rode "salvar"`);
+  const outras = guardadas.filter((s) => s.email !== a.email);
+  if (!outras.length) throw new Error('so ha uma conta guardada; o ensaio precisa de uma segunda');
+
+  const stAntes = estado();
+  const st = JSON.parse(JSON.stringify(stAntes));
+  const credAntes = a.store.ler();
+  const identAntes = lerJson(P.ident);
+  const conferir = (esperada) => {
+    const c = a.store.ler(); const i = lerJson(P.ident);
+    if (!c.claudeAiOauth || c.claudeAiOauth.accessToken !== esperada.claudeAiOauth.accessToken) throw new Error('o login lido de volta nao e o da conta esperada');
+    if (!i.oauthAccount || i.oauthAccount.emailAddress !== esperada.email) throw new Error('a identidade lida de volta nao e a da conta esperada');
+  };
+  const relatorio = [];
+  try {
+    for (const alvo of outras) {
+      aplicar(a, alvo, st, 'ensaio', 'ensaio'); conferir(alvo);
+      relatorio.push(`${a.email} -> ${alvo.email}: ok (login e identidade conferidos)`);
+      const original = lerJson(slot(a.email)); // o aplicar acabou de guardar a conta original, ja com o token mais novo
+      aplicar(atual(), original, st, 'ensaio', 'ensaio'); conferir(original);
+      relatorio.push(`${alvo.email} -> ${a.email}: ok (voltou ao original)`);
+    }
+  } catch (e) {
+    try { a.store.gravar(credAntes); gravar(P.ident, identAntes); } catch (e2) { log(`ERRO ensaio ao restaurar: ${e2.message}`); }
+    stAntes._ensaio = { ok: false, em: new Date().toISOString(), erro: e.message };
+    gravar(P.estado, stAntes);
+    throw new Error(`ensaio falhou: ${e.message} (o login original foi restaurado)`);
+  }
+  // o ensaio nao pode deixar rastro de "troca recente" nem de "ultima troca": volta ao estado de antes
+  stAntes._ensaio = { ok: true, em: new Date().toISOString(), contas: guardadas.map((s) => s.email).sort() };
+  gravar(P.estado, stAntes);
+  log(`ENSAIO ok: ${a.email} <-> ${outras.map((s) => s.email).join(', ')}`);
+  console.log(relatorio.join('\n'));
+  console.log(`Conta ativa de novo: ${a.email}`);
+}
+
+// Aviso curto no inicio da sessao enquanto o cadastro nao estiver completo. Silencioso quando esta tudo certo
+// e quando algo falha (um lembrete nunca pode atrapalhar a abertura da sessao).
+function lembrete() {
+  try {
+    if (CFG.lembrete === false) return;
+    const g = progresso();
+    if (g.n === 5 || g.n === 1) return; // pronto, ou sem login legivel (quem usa chave de API nao deve ser incomodado)
+    const o = {
+      2: 'nenhuma conta guardada ainda',
+      3: g.vencidas.length ? `${g.vencidas[0].email} precisa de /login de novo` : 'so 1 conta guardada',
+      4: 'a troca ainda nao foi testada',
+    }[g.n];
+    process.stdout.write(JSON.stringify({ systemMessage: `troca-conta: ${o}. Digite /troca-conta:troca-conta para o passo a passo (cerca de 2 minutos).` }));
+  } catch { /* silencioso de proposito */ }
 }
 
 function diagnosticar() {
@@ -283,7 +439,7 @@ function diagnosticar() {
 function configCmd(chave, valor) {
   const atualCfg = lerOpcional(P.config);
   if (!chave) { console.log(JSON.stringify({ ...config() }, null, 2)); return; }
-  if (!['esperar', 'maxEsperaHoras', 'mac'].includes(chave)) throw new Error('chaves: esperar, maxEsperaHoras, mac');
+  if (!['esperar', 'maxEsperaHoras', 'mac', 'lembrete'].includes(chave)) throw new Error('chaves: esperar, maxEsperaHoras, mac, lembrete');
   const v = chave === 'maxEsperaHoras' ? Number(valor) : /^(on|true|1|sim)$/i.test(valor);
   if (chave === 'maxEsperaHoras' && !(v > 0)) throw new Error('maxEsperaHoras precisa ser um numero > 0');
   fs.mkdirSync(P.dir, { recursive: true });
@@ -308,9 +464,12 @@ try {
   else if (cmd === 'status') status();
   else if (cmd === 'trocar') trocar({ hook: flags.includes('--hook'), dry: flags.includes('--dry'), para: args.find((x) => x.includes('@')) });
   else if (cmd === 'diagnosticar') diagnosticar();
+  else if (cmd === 'guia') guia();
+  else if (cmd === 'ensaio') ensaio();
+  else if (cmd === 'lembrete') lembrete();
   else if (cmd === 'config') configCmd(args[0], args[1]);
   else if (cmd === 'esquecer') esquecer(args[0]);
-  else console.log('uso: salvar | status | trocar [email] [--dry] | trocar --hook | diagnosticar | esquecer <email> | config [chave valor]');
+  else console.log('uso: guia | salvar | status | trocar [email] [--dry] | trocar --hook | ensaio | diagnosticar | esquecer <email> | config [chave valor] | lembrete');
 } catch (e) {
   log(`ERRO ${cmd}: ${e.message}`);
   console.error('erro: ' + e.message);

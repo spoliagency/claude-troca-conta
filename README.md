@@ -14,12 +14,24 @@ claude plugin marketplace add spoliagency/claude-troca-conta
 claude plugin install troca-conta@spoli-ferramentas
 ```
 
-Reinicie o Claude Code (hook novo so vale em sessao nova). Depois cadastre as contas:
+Reinicie o Claude Code (hook novo so vale em sessao nova). Enquanto o cadastro nao estiver completo, cada
+sessao nova abre com um aviso: `troca-conta: so 1 conta guardada. Digite /troca-conta:troca-conta ...`.
 
-1. Logada na conta A: `/troca-conta:troca-conta` (a skill conduz) ou direto
-   `node <plugin>/scripts/trocar-conta.js salvar`.
-2. Rode `/login` e entre na conta B. **Nunca `/logout`**: o logout revoga o token e a copia guardada morre.
-3. Logada na B: `salvar` de novo. `status` tem que listar as duas. Repita para mais contas.
+## Cadastro guiado (cerca de 2 minutos)
+
+Digite **`/troca-conta:troca-conta`**. O assistente conduz 4 passos, um de cada vez, e antes de cada um le o estado
+real (login e contas guardadas), nao a conversa:
+
+| Passo | O que acontece | Prova que o passo fechou |
+|---|---|---|
+| 1. Login lido | confere a conta logada agora | `[ok] 1. Login do Claude Code lido: a@x.com` |
+| 2. Primeira conta guardada | o assistente roda `salvar` | `[ok] 2.` |
+| 3. Segunda conta guardada | **voce** digita `/login` e entra na OUTRA conta (nunca `/logout`); o assistente roda `salvar` | `[ok] 3.` com login valido nas duas |
+| 4. Troca testada | o assistente roda `ensaio`: troca para cada outra conta e volta, conferindo login e identidade lidos de volta | `[ok] 4.` e `ESTADO: PRONTO` |
+
+No fim ele mostra o quadro **"Tudo pronto"** com as contas, a data do ensaio e o que vai acontecer. Depois de uma troca
+por limite de verdade, `status` e `guia` mostram a **"ultima troca"** (de quem para quem, quando e por que): essa e a
+confirmacao de que funcionou no uso real. Os mesmos comandos funcionam direto no terminal (`guia`, `salvar`, `ensaio`).
 
 Cada PC faz o proprio cadastro. **Nao copie a pasta `~/.claude/contas` entre PCs**: o token de renovacao
 muda a cada uso, e a mesma copia em dois PCs invalida um deles.
@@ -45,12 +57,14 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 
 | Comando | O que faz |
 |---|---|
+| `guia` | onde voce esta no cadastro (passo X de 4) e o que fazer agora; `ESTADO: PRONTO` ao final |
 | `salvar` | guarda a conta logada agora |
-| `status` | contas guardadas, a ativa, quem esta no limite e ate quando, validade do login |
+| `ensaio` | troca para cada outra conta e volta, conferindo (prova que funciona nesta maquina) |
+| `status` | contas guardadas, a ativa, quem esta no limite e ate quando, validade do login, ultima troca |
 | `trocar [email] [--dry]` | troca na mao |
 | `diagnosticar` | confere o ambiente sem alterar nada |
 | `esquecer <email>` | apaga uma conta guardada |
-| `config [chave valor]` | `esperar on/off`, `maxEsperaHoras N`, `mac on/off` |
+| `config [chave valor]` | `esperar on/off`, `maxEsperaHoras N`, `mac on/off`, `lembrete on/off` |
 
 ## Plataformas
 
@@ -69,7 +83,7 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 - **`trustedDeviceToken`**: pertence a conta+dispositivo; acompanha a conta na troca.
 - **Token de renovacao vencido** numa conta guardada: a conta e pulada e o aviso diz para fazer `/login` nela.
 - **Varias sessoes abertas**: dividem o mesmo login; uma sessao vizinha so e acordada, sem marcar a conta nova
-  como no limite por engano. Duas esperas simultaneas: so uma acorda.
+  como no limite por engano. Varias esperas simultaneas: uma trava de arquivo garante que so uma troca e acorda.
 - **Gravacao ruim**: o script le de volta e compara; se nao bater, restaura o login anterior.
 - **Aviso do sistema**: balao no Windows, `osascript` no Mac, `notify-send` no Linux (se existir).
 - **Node**: precisa de Node 18+ no PATH (o hook roda `node`).
@@ -83,15 +97,20 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
   retomada duplicada, desligue por la.
 - O modo interativo (TUI) nao foi coberto pelo E2E automatico (usa `claude -p` em sessao longa). O mecanismo de
   acordar e o de ler o login novo sao os mesmos, mas a primeira troca real vale conferir olhando.
+- O assistente guiado e testado onde e deterministico: `guia`, `ensaio`, `lembrete`, o hook de inicio de sessao e
+  se a skill carrega com o caminho do script resolvido. **Nao** ha teste automatizado de um modelo real
+  conduzindo a conversa dos 4 passos: a skill amarra o modelo ao `guia` para isso nao depender de memoria, mas
+  o primeiro uso real vale acompanhar.
 - Se existir `.device-keys.json`, o Claude pode pedir para registrar o dispositivo de novo na primeira troca.
 - No Mac, as contas guardadas ficam em arquivo (`chmod 600`) dentro de `~/.claude/contas`, nao no Keychain.
 
 ## Testes
 
 ```
-npm test                 # unitarios + fluxo + Keychain falso (rapido)
+npm test                 # unitarios + fluxo + Keychain falso + assistente guiado (57 testes, rapido)
 npm run validar          # claude plugin validate --strict
-E2E_CLAUDE=<claude.exe> npm run e2e [troca|ambas]
+E2E_CLAUDE=<claude.exe> npm run e2e [troca|ambas]       # limite de verdade, com servidor falso de API
+E2E_CLAUDE=<claude.exe> node tests/e2e/e2e-lembrete.js  # aviso de inicio de sessao, no Claude Code real
 ```
 
 O E2E instala o plugin pelo marketplace num diretorio isolado com espacos no caminho, sobe um servidor falso

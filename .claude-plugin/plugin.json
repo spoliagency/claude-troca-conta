@@ -1,6 +1,6 @@
 {
   "name": "troca-conta",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Quando uma conta do Claude Code bate o limite de uso, troca para a outra e retoma a sessao sozinho; com todas no limite, espera a primeira renovar. Windows e Linux; Mac experimental.",
   "author": {
     "name": "Spoli Agency"
