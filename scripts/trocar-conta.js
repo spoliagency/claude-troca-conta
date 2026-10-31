@@ -127,18 +127,19 @@ function aguardar(volta, sessao, inicio) {
 // Trava de arquivo: duas esperas que acordam no mesmo instante leem o estado antes de qualquer uma gravar,
 // e as duas trocariam e acordariam a sessao. Criar o arquivo com "wx" e atomico: so uma passa.
 const TRAVA = path.join(P.dir, 'retomada.lock');
-function pegarTrava() {
+const TRAVA_TROCA = path.join(P.dir, 'troca.lock');
+function pegarTrava(f = TRAVA) {
   try {
     fs.mkdirSync(P.dir, { recursive: true });
-    const fd = fs.openSync(TRAVA, 'wx');
+    const fd = fs.openSync(f, 'wx');
     fs.closeSync(fd);
     return true;
   } catch {
-    try { if (Date.now() - fs.statSync(TRAVA).mtimeMs > 60000) { fs.unlinkSync(TRAVA); return pegarTrava(); } } catch { /* sumiu: tenta de novo na proxima volta */ }
+    try { if (Date.now() - fs.statSync(f).mtimeMs > 60000) { fs.unlinkSync(f); return pegarTrava(f); } } catch { /* sumiu: tenta de novo na proxima volta */ }
     return false;
   }
 }
-const soltarTrava = () => { try { fs.unlinkSync(TRAVA); } catch { /* ja solta */ } };
+const soltarTrava = (f = TRAVA) => { try { fs.unlinkSync(f); } catch { /* ja solta */ } };
 
 // Decide e executa a troca da retomada com a trava na mao. Devolve o que fazer depois de soltar a trava.
 function decidirRetomada(sessao, inicio) {
@@ -178,7 +179,19 @@ function retomar(sessao, inicio) {
 
 function lerStdin() { try { return JSON.parse(fs.readFileSync(0, 'utf8')); } catch { return {}; } }
 
-function trocar({ hook, dry, para, entradaPronta }) {
+// Dois hooks juntos (sessoes vizinhas no mesmo limite) leem login e estado e depois gravam: o 2o pode ler o
+// login ja trocado pelo 1o antes de o estado dele existir, e marcar a conta nova no limite por engano.
+// A leitura-decisao-troca entra numa trava; a espera e o acordar ficam de fora (so agendam timers).
+function trocar(opcoes) {
+  const hook = opcoes.hook;
+  const entrada = hook ? (opcoes.entradaPronta || lerStdin()) : {};
+  const fim = Date.now() + 5000;
+  let pegou = false;
+  while (hook && !(pegou = pegarTrava(TRAVA_TROCA)) && Date.now() < fim) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  try { trocarSemTrava({ ...opcoes, entradaPronta: entrada }); } finally { if (pegou) soltarTrava(TRAVA_TROCA); }
+}
+
+function trocarSemTrava({ hook, dry, para, entradaPronta }) {
   const entrada = hook ? (entradaPronta || lerStdin()) : {};
   if (hook && entrada.error && entrada.error !== 'rate_limit') return;
 
@@ -195,8 +208,12 @@ function trocar({ hook, dry, para, entradaPronta }) {
     return;
   }
 
+  // Depois de "volta-primeiro" a conta nova JA esta marcada (de proposito), entao o teste acima nao distingue:
+  // outra sessao que falhou na conta antiga nao pode remarcar a nova com a hora do aviso da antiga. So junta-se a espera.
+  const naEspera = hook && recente && st._sessao !== entrada.session_id && st._ultima && st._ultima.motivo === 'volta-primeiro' && st._ultima.para === a.email;
+
   // Marca a conta que bateu no limite. Manual (sem --hook) nao marca: foi escolha dela.
-  if (hook) {
+  if (hook && !naEspera) {
     const reset = lerReset(`${entrada.last_assistant_message || ''} ${entrada.error_details || ''}`);
     st[a.email] = { limiteAte: (reset || new Date(agora + FALLBACK_LIMITE_MS)).toISOString(), horaExata: !!reset };
   }
@@ -220,17 +237,34 @@ function trocar({ hook, dry, para, entradaPronta }) {
   const alvo = outras.find((s) => !limitada(st, s.email, agora));
 
   if (!alvo) {
-    const volta = proximaVolta(st, outras.map((s) => s.email).concat(a.email));
-    const msg = `todas as contas no limite; a primeira volta ${hhmm(volta)}`;
+    // Todas no limite: a sessao fica na conta que renova PRIMEIRA (empate = a atual, trocar custa um refresh).
+    // Assim a espera termina na conta certa, e o proprio Claude Code retoma ali se este hook morrer.
+    const hora = (e) => new Date(st[e].limiteAte).getTime();
+    const primeira = outras.reduce((m, s) => (hora(s.email) < hora(m) ? s.email : m), a.email);
+    const volta = hora(primeira);
+    const msg = `todas as contas no limite; a primeira volta ${hhmm(volta)} (${primeira})`;
     log(msg);
-    if (!dry) gravar(P.estado, st);
-    if (!hook) { console.log(msg); return; }
+    if (!hook) { if (!dry) gravar(P.estado, st); console.log(msg); return; }
+    if (dry) { console.log(`[dry] ${msg}${primeira !== a.email ? `; passaria ${a.email} -> ${primeira}` : '; ficaria em ' + a.email}`); return; }
+
+    let inicio = agora;
+    if (primeira !== a.email) {
+      try {
+        aplicar(a, outras.find((s) => s.email === primeira), st, entrada.session_id, 'volta-primeiro');
+        log(`TROCOU (volta-primeiro): ${a.email} -> ${primeira}`);
+        inicio = st._ultimaTroca; // a espera nao pode se confundir com a propria troca ("ja foi retomado")
+      } catch (e) { // sem a troca a espera ainda funciona: troca ao renovar
+        log(`ERRO trocando pra conta que volta primeiro: ${e.message}`);
+        gravar(P.estado, st);
+      }
+    } else gravar(P.estado, st);
+
     if (!CFG.esperar || volta - agora > MAX_ESPERA_MS) {
-      avisar('Claude: todas as contas no limite', `A primeira volta ${hhmm(volta)}${CFG.esperar ? ', longe demais pra esperar' : ''}.`);
+      avisar('Claude: todas as contas no limite', `A primeira (${primeira}) volta ${hhmm(volta)}${CFG.esperar ? ', longe demais pra esperar' : ''}.`);
       return;
     }
-    avisar('Claude: todas as contas no limite', `Volto sozinho por volta de ${hhmm(volta)}.`);
-    aguardar(volta, entrada.session_id, agora);
+    avisar('Claude: todas as contas no limite', `Na conta ${primeira}, que volta primeiro. Volto sozinho por volta de ${hhmm(volta)}.`);
+    aguardar(volta, entrada.session_id, inicio);
     return;
   }
 

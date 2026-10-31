@@ -73,6 +73,39 @@ test('as duas no limite: espera a primeira renovar, troca, acorda e guarda o tok
   assert.equal(w.slot('a@x.com').claudeAiOauth.accessToken, 'acc-A-RENOVADO');
 });
 
+test('as duas no limite: ja ESPERA na conta que volta primeiro e acorda nela', async (t) => {
+  const w = duasContas(); t.after(w.limpar);
+  w.hook(LONGE, 's1'); // B -> A, B marcada
+  soltarTrava(w);
+  w.mudarEstado((e) => { e['b@x.com'] = { limiteAte: new Date(Date.now() + 2500).toISOString() }; });
+  const p = w.hookAsync(LONGE, 's1', RAPIDO); // A bate o limite tambem; B volta em 2,5s
+  await new Promise((ok) => setTimeout(ok, 1000));
+  assert.equal(w.quem(), 'b@x.com', 'a sessao tem que estar na conta que volta primeiro ENQUANTO espera');
+  const r = await p;
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /limite foi renovado.*b@x\.com/s);
+  assert.equal(w.quem(), 'b@x.com');
+  assert.match(w.log(), /TROCOU \(volta-primeiro\): a@x\.com -> b@x\.com/);
+});
+
+test('as duas no limite, volta longe demais: nao espera, mas fica na que volta primeiro', (t) => {
+  const w = duasContas(); t.after(w.limpar);
+  w.hook(LONGE, 's1'); soltarTrava(w); // B -> A
+  w.mudarEstado((e) => { e['b@x.com'] = { limiteAte: new Date(Date.now() + 3600e3).toISOString() }; });
+  const r = w.hook(LONGE, 's1', SEM_ESPERA); // A volta em 3 dias, B em 1h
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(w.quem(), 'b@x.com');
+});
+
+test('as duas no limite e a atual volta primeiro: fica nela, sem trocar', (t) => {
+  const w = duasContas(); t.after(w.limpar);
+  w.hook(LONGE, 's1'); soltarTrava(w); // B -> A, B marcada ate 3 dias
+  const r = w.hook("You've hit your limit · resets in 2h", 's1', SEM_ESPERA); // A volta em 2h
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(w.quem(), 'a@x.com');
+  assert.doesNotMatch(w.log(), /volta-primeiro/);
+});
+
 test('duas esperas ao mesmo tempo (usuaria digitou de novo): so uma acorda', async (t) => {
   const w = duasContas(); t.after(w.limpar);
   w.hook(LONGE, 's1'); // B -> A
@@ -80,7 +113,7 @@ test('duas esperas ao mesmo tempo (usuaria digitou de novo): so uma acorda', asy
   w.mudarEstado((e) => { e['b@x.com'] = { limiteAte: new Date(Date.now() + 2500).toISOString() }; });
   const p1 = w.hookAsync(LONGE, 's1', RAPIDO);
   await new Promise((ok) => setTimeout(ok, 300));
-  const p2 = w.hookAsync(LONGE, 's1', RAPIDO);
+  const p2 = w.hookAsync(LONGE, 's2', RAPIDO); // sessao vizinha
   const [r1, r2] = await Promise.all([p1, p2]);
   assert.deepEqual([r1.status, r2.status].sort(), [0, 2], `exatamente um acorda: ${r1.status}/${r2.status}`);
   assert.equal(w.quem(), 'b@x.com');
@@ -92,7 +125,7 @@ test('quatro esperas acordando NO MESMO INSTANTE (5 rodadas): exatamente uma aco
     w.hook(LONGE, 's1'); // B -> A
     soltarTrava(w);
     w.mudarEstado((e) => { e['b@x.com'] = { limiteAte: new Date(Date.now() + 1800).toISOString() }; });
-    const rs = await Promise.all([1, 2, 3, 4].map(() => w.hookAsync(LONGE, 's1', RAPIDO)));
+    const rs = await Promise.all([1, 2, 3, 4].map((i) => w.hookAsync(LONGE, 's' + i, RAPIDO)));
     const acordaram = rs.filter((r) => r.status === 2).length;
     assert.equal(acordaram, 1, `rodada ${rodada}: ${rs.map((r) => r.status).join('/')} (so uma pode acordar a sessao)`);
     assert.equal(w.quem(), 'b@x.com');

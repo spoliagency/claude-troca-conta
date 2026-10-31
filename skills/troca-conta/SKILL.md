@@ -80,7 +80,7 @@ resposta seguinte saiu pela outra conta (a pessoa confere com `/status`), e rode
 | `config` | mostra as opcoes; `config esperar off`, `config maxEsperaHoras 3`, `config lembrete off` |
 
 Comportamento automatico (nada a fazer): ao bater o limite a sessao troca de conta e retoma sozinha; com todas as
-contas no limite o hook espera a primeira renovar (ate `maxEsperaHoras`, padrao 5h30) e entao troca e retoma. Passando
+contas no limite o hook ja troca pra a conta que renova primeiro e espera ela renovar (ate `maxEsperaHoras`, padrao 5h30) e entao troca e retoma. Passando
 disso (limite semanal), so avisa a hora da volta. Cada troca gera um aviso do sistema e uma linha em `contas/trocas.log`.
 
 ## Mac (experimental)
