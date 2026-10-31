@@ -1,6 +1,6 @@
 {
   "name": "claude-troca-conta",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Plugin do Claude Code: troca de conta ao bater o limite, com retomada automatica.",
   "scripts": {

@@ -48,8 +48,8 @@ o limite e AVISADO antes de estourar (o modelo para sozinho, turno termina norma
    -> o hook Stop le o transcript, acha a nota "usage limit reached" do Claude Code e faz a mesma troca
    -> acorda a sessao dizendo pra continuar o que ficou pendente na ultima resposta
 as duas no limite
-   -> o hook fica vivo, conferindo a hora a cada 30 s, ate a primeira renovar (max 5h30)
-   -> troca (ou fica) na conta liberada e acorda a sessao
+   -> descobre qual das contas renova PRIMEIRO e ja troca pra ela na hora (se for a atual, fica)
+   -> o hook fica vivo, conferindo a hora a cada 30 s, ate ela renovar (max 5h30), e entao acorda a sessao
 ```
 
 Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`.
