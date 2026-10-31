@@ -15,9 +15,10 @@
 //   lembrete                   aviso de inicio de sessao (hook SessionStart), mudo quando esta tudo certo
 //   trocar [email] [--dry]     troca de conta agora (manual)
 //   trocar --hook              modo hook StopFailure/rate_limit (le o JSON do stdin)
+//   parou                      modo hook Stop: o limite foi AVISADO antes de estourar (le o transcript)
 //   diagnosticar               confere o ambiente, sem alterar nada
 //   esquecer <email>           apaga uma conta guardada
-//   config [chave valor]       mostra ou muda: esperar, maxEsperaHoras, mac
+//   config [chave valor]       mostra ou muda: esperar, maxEsperaHoras, mac, lembrete, antecipar
 
 const fs = require('fs');
 const path = require('path');
@@ -37,7 +38,7 @@ const ANTI_PINGPONG_MS = 60 * 1000;
 const RETOMAR = 'Retome exatamente de onde parou, sem pedir confirmacao e sem repetir o que ja foi feito.';
 
 function lerOpcional(f) { try { return lerJson(f); } catch { return {}; } }
-function config() { return { esperar: true, maxEsperaHoras: 5.5, mac: false, lembrete: true, ...lerOpcional(P.config) }; }
+function config() { return { esperar: true, maxEsperaHoras: 5.5, mac: false, lembrete: true, antecipar: true, ...lerOpcional(P.config) }; }
 const CFG = config();
 
 // Variaveis de ambiente existem pra teste (relogio acelerado); o uso normal vem do config.json.
@@ -177,8 +178,8 @@ function retomar(sessao, inicio) {
 
 function lerStdin() { try { return JSON.parse(fs.readFileSync(0, 'utf8')); } catch { return {}; } }
 
-function trocar({ hook, dry, para }) {
-  const entrada = hook ? lerStdin() : {};
+function trocar({ hook, dry, para, entradaPronta }) {
+  const entrada = hook ? (entradaPronta || lerStdin()) : {};
   if (hook && entrada.error && entrada.error !== 'rate_limit') return;
 
   const a = atual();
@@ -235,12 +236,87 @@ function trocar({ hook, dry, para }) {
 
   if (dry) { console.log(`[dry] trocaria ${a.email} -> ${alvo.email}`); return; }
 
-  aplicar(a, alvo, st, entrada.session_id, hook ? 'limite' : 'manual');
-  log(`TROCOU (${hook ? 'limite' : 'manual'}): ${a.email} -> ${alvo.email}`);
+  const motivo = entrada.antecipado ? 'aviso' : hook ? 'limite' : 'manual';
+  aplicar(a, alvo, st, entrada.session_id, motivo);
+  log(`TROCOU (${motivo}): ${a.email} -> ${alvo.email}`);
   if (hook) {
     avisar(`Claude trocou para ${alvo.email}`, `${a.email} bateu o limite. Retomando sozinho.`);
-    acordar(`[troca-conta] ${a.email} bateu o limite de uso; a sessao ja esta na conta ${alvo.email}. ${RETOMAR}`);
+    acordar(`[troca-conta] ${a.email} bateu o limite de uso; a sessao ja esta na conta ${alvo.email}. ${entrada.antecipado ? PENDENTE : ''}${RETOMAR}`);
   } else console.log(`${a.email} -> ${alvo.email}`);
+}
+
+// --- limite avisado ANTES de estourar ---------------------------------------------------------
+// Perto do limite o Claude Code injeta na conversa uma nota ("Usage limit reached; a short grace
+// allowance remains...", marcada usageLimitNote:"wrap_up") e o modelo encerra o turno por conta propria.
+// Isso e um fim de turno NORMAL: o StopFailure/rate_limit nao dispara, a conta so trocava quando a pessoa
+// digitava de novo e batia no limite de verdade. Este caminho le a nota no transcript, no hook Stop.
+const PENDENTE = 'Sua ultima resposta parou cedo por causa do aviso de limite (a conta ja foi trocada): continue o que ficou pendente nela. ';
+const NOTA_RE = /"usageLimitNote":"(wrap_up|release)"/;
+const NOTA_RECENTE_MS = 15 * 60 * 1000;
+const TAIL_BYTES = 512 * 1024;
+const ESPERA_AVISO_MS = process.env.TROCAR_ESPERA_AVISO_MS !== undefined ? Number(process.env.TROCAR_ESPERA_AVISO_MS) : 3000;
+
+function lerFimDoArquivo(f) {
+  const fd = fs.openSync(f, 'r');
+  try {
+    const { size } = fs.fstatSync(fd);
+    const ini = Math.max(0, size - TAIL_BYTES);
+    const buf = Buffer.alloc(size - ini);
+    fs.readSync(fd, buf, 0, buf.length, ini);
+    const linhas = buf.toString('utf8').split('\n');
+    if (ini > 0) linhas.shift(); // primeira linha pode ter sido cortada no meio
+    return linhas;
+  } finally { fs.closeSync(fd); }
+}
+
+// Procura, de tras pra frente, a nota "wrap_up" do turno que acabou de terminar.
+// Devolve { uuid, ts, reset } ou null. `reset` vem da linha "continuing automatically at 1:40am" que o
+// cliente escreve logo depois do Stop (pode ainda nao estar la).
+function acharNotaDeLimite(transcript) {
+  const linhas = lerFimDoArquivo(transcript);
+  let reset = null;
+  for (let i = linhas.length - 1; i >= 0; i--) {
+    const l = linhas[i];
+    if (!l) continue;
+    if (!NOTA_RE.test(l)) {
+      if (reset === null && /continuing automatically at/.test(l)) {
+        try { const m = /continuing automatically at ([^·"]+)/.exec(JSON.parse(l).content || ''); if (m) reset = m[1].trim(); } catch { /* linha ilegivel: ignora */ }
+      }
+      if (/"origin":\{"kind":"human"\}/.test(l)) return null; // chegou na pergunta da pessoa sem achar nota: nao e deste turno
+      continue;
+    }
+    let o; try { o = JSON.parse(l); } catch { continue; }
+    if (o.usageLimitNote !== 'wrap_up') return null; // "release": o limite foi liberado depois
+    return { uuid: o.uuid, ts: new Date(o.timestamp).getTime(), reset };
+  }
+  return null;
+}
+
+function parou() {
+  const entrada = lerStdin();
+  if (CFG.antecipar === false || !entrada.transcript_path) return;
+  let nota;
+  try { nota = acharNotaDeLimite(entrada.transcript_path); } catch { return; } // transcript ilegivel: nao e problema de conta
+  if (!nota) return;
+  const st = estado();
+  if (st._graceUuid === nota.uuid) return; // ja tratada
+  if (st._ultimaTroca && st._ultimaTroca > nota.ts) return; // a conta mudou depois da nota: a nota e da conta antiga
+  if (Date.now() - nota.ts > NOTA_RECENTE_MS) return;
+
+  // A hora do reset aparece logo apos o Stop; espera um pouco por ela em vez de chutar 5h.
+  const fim = Date.now() + ESPERA_AVISO_MS;
+  while (!nota.reset && Date.now() < fim) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+    nota = acharNotaDeLimite(entrada.transcript_path) || nota;
+  }
+
+  st._graceUuid = nota.uuid;
+  gravar(P.estado, st);
+  log(`AVISO de limite antes de estourar (sessao ${entrada.session_id}); reset ${nota.reset || 'desconhecido, uso 5h'}`);
+  trocar({
+    hook: true,
+    entradaPronta: { error: 'rate_limit', session_id: entrada.session_id, antecipado: true, last_assistant_message: nota.reset ? `resets ${nota.reset}` : '' },
+  });
 }
 
 function dias(ms) { return Math.floor((ms - Date.now()) / 864e5); }
@@ -439,7 +515,7 @@ function diagnosticar() {
 function configCmd(chave, valor) {
   const atualCfg = lerOpcional(P.config);
   if (!chave) { console.log(JSON.stringify({ ...config() }, null, 2)); return; }
-  if (!['esperar', 'maxEsperaHoras', 'mac', 'lembrete'].includes(chave)) throw new Error('chaves: esperar, maxEsperaHoras, mac, lembrete');
+  if (!['esperar', 'maxEsperaHoras', 'mac', 'lembrete', 'antecipar'].includes(chave)) throw new Error('chaves: esperar, maxEsperaHoras, mac, lembrete, antecipar');
   const v = chave === 'maxEsperaHoras' ? Number(valor) : /^(on|true|1|sim)$/i.test(valor);
   if (chave === 'maxEsperaHoras' && !(v > 0)) throw new Error('maxEsperaHoras precisa ser um numero > 0');
   fs.mkdirSync(P.dir, { recursive: true });
@@ -463,13 +539,14 @@ try {
   if (cmd === 'salvar') { const a = atual(); guardar(a); console.log('guardada: ' + a.email); }
   else if (cmd === 'status') status();
   else if (cmd === 'trocar') trocar({ hook: flags.includes('--hook'), dry: flags.includes('--dry'), para: args.find((x) => x.includes('@')) });
+  else if (cmd === 'parou') parou();
   else if (cmd === 'diagnosticar') diagnosticar();
   else if (cmd === 'guia') guia();
   else if (cmd === 'ensaio') ensaio();
   else if (cmd === 'lembrete') lembrete();
   else if (cmd === 'config') configCmd(args[0], args[1]);
   else if (cmd === 'esquecer') esquecer(args[0]);
-  else console.log('uso: guia | salvar | status | trocar [email] [--dry] | trocar --hook | ensaio | diagnosticar | esquecer <email> | config [chave valor] | lembrete');
+  else console.log('uso: guia | salvar | status | trocar [email] [--dry] | trocar --hook | parou | ensaio | diagnosticar | esquecer <email> | config [chave valor] | lembrete');
 } catch (e) {
   log(`ERRO ${cmd}: ${e.message}`);
   console.error('erro: ' + e.message);
