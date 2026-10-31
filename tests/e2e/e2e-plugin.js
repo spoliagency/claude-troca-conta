@@ -9,6 +9,8 @@
 //
 // Cenarios:  troca  = so a A esta no limite -> troca pra B e retoma
 //            ambas  = A e B no limite ate um horario -> espera renovar, retoma (leva ~2 min)
+//            aviso  = o Claude Code AVISA o limite antes de estourar (nota wrap_up no transcript, turno termina normal,
+//                     sem 429): o hook Stop tem que trocar e acordar a sessao
 //
 // Uso: E2E_CLAUDE="C:/caminho/claude.exe" node tests/e2e/e2e-plugin.js [troca|ambas]   (padrao: os dois)
 // Precisa do Claude Code instalado. Nao usa a sua conta nem o seu ~/.claude.
@@ -49,7 +51,8 @@ async function cenario(nome) {
   const envBase = { ...process.env, CLAUDE_CONFIG_DIR: CFG, TROCAR_SEM_AVISO: '1', TROCAR_ACORDAR_MS: '500', TROCAR_MARGEM_MS: '0', TROCAR_POLL_MS: '500', DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_TELEMETRY: '1' };
   delete envBase.ANTHROPIC_API_KEY; delete envBase.CLAUDE_CODE_OAUTH_TOKEN; delete envBase.ANTHROPIC_AUTH_TOKEN;
   const claude = (args) => {
-    const r = spawnSync(CLAUDE, args, { env: envBase, encoding: 'utf8', shell: SHELL, timeout: 120000 });
+    const argv = SHELL ? args.map((x) => (/\s/.test(x) ? `"${x}"` : x)) : args; // com shell no Windows, caminho com espaco precisa de aspas
+    const r = spawnSync(CLAUDE, argv, { env: envBase, encoding: 'utf8', shell: SHELL, timeout: 120000 });
     return { status: r.status, out: (r.stdout || '') + (r.stderr || '') };
   };
 
@@ -82,7 +85,7 @@ async function cenario(nome) {
   // "ambas": o limite acaba num minuto cheio ~1-2 min a frente (o aviso so tem precisao de minuto)
   const agoraS = Math.floor(Date.now() / 1000);
   const resetEpoch = nome === 'ambas' ? (Math.floor(agoraS / 60) + 2) * 60 : agoraS + 3 * 3600;
-  const livre = (auth) => (nome === 'troca' ? auth.endsWith('acc-B') : Date.now() >= resetEpoch * 1000);
+  const livre = (auth) => (nome === 'aviso' ? true : nome === 'troca' ? auth.endsWith('acc-B') : Date.now() >= resetEpoch * 1000);
   const server = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
@@ -99,7 +102,12 @@ async function cenario(nome) {
           return res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Number of requests has exceeded your rate limit.' } }));
         }
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-        return res.end(sse('RETOMADO-SOZINHO'));
+        if (nome !== 'aviso' || auth.endsWith('acc-B')) return res.end(sse('RETOMADO-SOZINHO'));
+        // aviso: a A responde devagar, pra dar tempo do injetor gravar a nota no transcript antes do fim do turno
+        const corte = 'event: content_block_stop';
+        const [ini, ...resto] = sse('RESPOSTA-DA-A').split(corte);
+        res.write(ini);
+        return setTimeout(() => res.end(corte + resto.join(corte)), 3000);
       }
       res.writeHead(404, { 'content-type': 'application/json' }); res.end('{}');
     });
@@ -112,10 +120,37 @@ async function cenario(nome) {
   const dumpHook = path.join(base, 'dump-hook.js');
   fs.writeFileSync(dumpHook, `require('fs').appendFileSync(${JSON.stringify(dump)}, require('fs').readFileSync(0,'utf8').replace(/\\s+/g,' ') + '\\n')`);
   const settingsExtra = path.join(base, 'settings-extra.json');
-  fs.writeFileSync(settingsExtra, JSON.stringify({ hooks: { StopFailure: [{ matcher: 'rate_limit', hooks: [{ type: 'command', command: `node "${dumpHook}"` }] }] } }));
+  const hooksExtra = { StopFailure: [{ matcher: 'rate_limit', hooks: [{ type: 'command', command: `node "${dumpHook}"` }] }] };
+  if (nome === 'aviso') {
+    // Imita o cliente: 1 s apos o pedido (resposta ainda em andamento) grava a nota "wrap_up" e a linha de reset no
+    // transcript. Formato copiado de uma sessao real. So na 1a vez, senao a retomada ganharia outra nota.
+    const injetor = path.join(base, 'injetor.js');
+    fs.writeFileSync(injetor, [
+      "const fs = require('fs');",
+      'const transcript = process.argv[2];',
+      'setTimeout(() => {',
+      '  const ts = new Date().toISOString();',
+      "  const grava = (o) => fs.appendFileSync(transcript, JSON.stringify(o) + String.fromCharCode(10));",
+      "  grava({ type: 'user', message: { role: 'user', content: '[Usage limit reached; a short grace allowance remains.]' }, isMeta: true, turnCompanion: true, usageLimitNote: 'wrap_up', uuid: 'e2e-nota-1', timestamp: ts });",
+      "  grava({ type: 'system', subtype: 'informational', content: 'Usage limit reached \\u00b7 continuing automatically at 11:59pm \\u00b7 esc to cancel', timestamp: ts });",
+      '}, 1000);',
+    ].join('\n'));
+    const lancador = path.join(base, 'lancador.js');
+    const marca = path.join(base, 'injetado');
+    fs.writeFileSync(lancador, [
+      "const fs = require('fs'); const { spawn } = require('child_process');",
+      "const entrada = JSON.parse(fs.readFileSync(0, 'utf8'));",
+      `if (!fs.existsSync(${JSON.stringify(marca)})) {`,
+      `  fs.writeFileSync(${JSON.stringify(marca)}, '1');`,
+      `  spawn(process.execPath, [${JSON.stringify(injetor)}, entrada.transcript_path], { detached: true, stdio: 'ignore' }).unref();`,
+      '}',
+    ].join('\n'));
+    hooksExtra.UserPromptSubmit = [{ hooks: [{ type: 'command', command: `node "${lancador}"` }] }];
+  }
+  fs.writeFileSync(settingsExtra, JSON.stringify({ hooks: hooksExtra }));
 
   // 5) sessao longa do Claude Code
-  const p = spawn(CLAUDE, ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--settings', settingsExtra],
+  const p = spawn(CLAUDE, ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--settings', SHELL ? `"${settingsExtra}"` : settingsExtra],
     { cwd: WORK, env: { ...envBase, ANTHROPIC_BASE_URL: `http://127.0.0.1:${porta}` }, stdio: ['pipe', 'pipe', 'pipe'], shell: SHELL });
   let saida = '';
   p.stdout.on('data', (d) => { saida += d; });
@@ -138,18 +173,22 @@ async function cenario(nome) {
   console.log('  trocas.log:\n    ' + log.trim().split('\n').join('\n    '));
 
   try {
-    assert.ok(entradas.length >= 1 && entradas.every((e) => e.error === 'rate_limit'), 'o Claude Code classificou o 429 como rate_limit e chamou o hook');
-    ok('o 429 virou StopFailure/rate_limit e o hook do plugin foi chamado');
+    if (nome === 'aviso') assert.equal(entradas.length, 0, 'nao houve 429: o StopFailure nao pode ter disparado');
+    else {
+      assert.ok(entradas.length >= 1 && entradas.every((e) => e.error === 'rate_limit'), 'o Claude Code classificou o 429 como rate_limit e chamou o hook');
+      ok('o 429 virou StopFailure/rate_limit e o hook do plugin foi chamado');
+    }
     assert.ok(saida.includes('RETOMADO-SOZINHO'), 'o modelo foi acordado e respondeu sem ninguem digitar');
     ok('a sessao foi acordada sozinha e respondeu (ninguem digitou "continua")');
     const credFinal = JSON.parse(fs.readFileSync(path.join(CFG, '.credentials.json'), 'utf8'));
     assert.equal(credFinal.mcpOAuth.servidorX.accessToken, 'MCP-INTACTO');
     ok('tokens de MCP intactos; caminho com espacos funcionou');
 
-    if (nome === 'troca') {
+    if (nome === 'troca' || nome === 'aviso') {
       assert.deepEqual([seq[0], seq[seq.length - 1]], ['A', 'B'], 'primeiro pedido na A, ultimo na B');
       ok('a sessao ABERTA passou a usar o token da conta B apos a troca');
-      assert.match(log, /TROCOU \(limite\): a@teste\.com -> b@teste\.com/);
+      if (nome === 'aviso') assert.match(log, /AVISO de limite antes de estourar[^\n]*\n[^\n]*TROCOU \(aviso\): a@teste\.com -> b@teste\.com/);
+      else assert.match(log, /TROCOU \(limite\): a@teste\.com -> b@teste\.com/);
       assert.equal(credFinal.claudeAiOauth.accessToken, 'acc-B');
       assert.equal(JSON.parse(fs.readFileSync(path.join(CFG, '.claude.json'), 'utf8')).oauthAccount.emailAddress, 'b@teste.com');
       ok('login e identidade ficaram na B');
@@ -172,7 +211,7 @@ async function cenario(nome) {
 
 (async () => {
   const pedido = process.argv[2];
-  const lista = pedido ? [pedido] : ['troca', 'ambas'];
+  const lista = pedido ? [pedido] : ['troca', 'aviso', 'ambas'];
   for (const n of lista) await cenario(n);
   console.log('\nE2E OK');
   process.exit(0);

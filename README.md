@@ -44,6 +44,9 @@ conta A bate o limite
    -> troca claudeAiOauth + oauthAccount pela conta B (o resto do login nao e tocado)
    -> o hook sai com codigo 2 (asyncRewake): a sessao acorda com "retome de onde parou"
    -> o Claude Code ja le o login novo: o proximo pedido sai com o token da B
+o limite e AVISADO antes de estourar (o modelo para sozinho, turno termina normal, sem erro)
+   -> o hook Stop le o transcript, acha a nota "usage limit reached" do Claude Code e faz a mesma troca
+   -> acorda a sessao dizendo pra continuar o que ficou pendente na ultima resposta
 as duas no limite
    -> o hook fica vivo, conferindo a hora a cada 30 s, ate a primeira renovar (max 5h30)
    -> troca (ou fica) na conta liberada e acorda a sessao
@@ -64,7 +67,7 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 | `trocar [email] [--dry]` | troca na mao |
 | `diagnosticar` | confere o ambiente sem alterar nada |
 | `esquecer <email>` | apaga uma conta guardada |
-| `config [chave valor]` | `esperar on/off`, `maxEsperaHoras N`, `mac on/off`, `lembrete on/off` |
+| `config [chave valor]` | `esperar on/off`, `maxEsperaHoras N`, `mac on/off`, `lembrete on/off`, `antecipar on/off` (trocar ja no aviso de limite, ligado por padrao) |
 
 ## Plataformas
 
@@ -95,6 +98,13 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 - O Claude Code tem um recurso nativo, **"Automatic continue"** (`/rate-limit-options`), que retoma a mesma sessao
   no reset da conta antiga. Nao foi possivel provocar isso no teste automatizado (e do modo interativo). Se gerar
   retomada duplicada, desligue por la.
+- **Troca no aviso de limite (v0.3.0):** perto do limite o Claude Code injeta uma nota na conversa e o modelo encerra
+  o turno sozinho; isso nao gera erro, entao so o hook `Stop` enxerga. Ele procura a nota `usageLimitNote:"wrap_up"`
+  no fim do transcript (so no turno que acabou, so nota de ate 15 min, e cada nota so uma vez). O formato foi copiado
+  de uma sessao real, mas a nota do E2E e gravada por um injetor de teste, nao pelo cliente: se uma versao nova do
+  Claude Code mudar o nome do campo, o aviso deixa de ser detectado e volta ao comportamento antigo (troca so
+  quando o limite estoura de verdade). Fica registrado em `trocas.log` como `AVISO de limite antes de estourar`.
+  Ainda nao provado: interacao com o "Automatic continue" nativo, que tambem mostra `continuing automatically at ...`.
 - O modo interativo (TUI) nao foi coberto pelo E2E automatico (usa `claude -p` em sessao longa). O mecanismo de
   acordar e o de ler o login novo sao os mesmos, mas a primeira troca real vale conferir olhando.
 - O assistente guiado e testado onde e deterministico: `guia`, `ensaio`, `lembrete`, o hook de inicio de sessao e
@@ -107,9 +117,9 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 ## Testes
 
 ```
-npm test                 # unitarios + fluxo + Keychain falso + assistente guiado (57 testes, rapido)
+npm test                 # unitarios + fluxo + Keychain falso + assistente guiado + troca no aviso de limite (71 testes, rapido)
 npm run validar          # claude plugin validate --strict
-E2E_CLAUDE=<claude.exe> npm run e2e [troca|ambas]       # limite de verdade, com servidor falso de API
+E2E_CLAUDE=<claude.exe> npm run e2e [troca|aviso|ambas]  # limite de verdade, com servidor falso de API
 E2E_CLAUDE=<claude.exe> node tests/e2e/e2e-lembrete.js  # aviso de inicio de sessao, no Claude Code real
 ```
 

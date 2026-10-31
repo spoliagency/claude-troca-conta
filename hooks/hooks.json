@@ -13,6 +13,18 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/trocar-conta.js\" parou --hook",
+            "timeout": 21000,
+            "asyncRewake": true
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "startup",
