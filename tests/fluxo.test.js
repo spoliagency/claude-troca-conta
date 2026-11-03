@@ -38,7 +38,7 @@ test('hook: troca, acorda (exit 2), preserva mcpOAuth e outras chaves', (t) => {
 
 test('erro que nao e rate_limit e ignorado', (t) => {
   const w = duasContas(); t.after(w.limpar);
-  const r = w.run(['trocar', '--hook'], w.hookIn('x', 's1', 'authentication_failed'));
+  const r = w.run(['trocar', '--hook'], w.hookIn('x', 's1', 'server_error'));
   assert.equal(r.status, 0); assert.equal(w.quem(), 'b@x.com');
 });
 

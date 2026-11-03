@@ -9,6 +9,7 @@
 //
 // Cenarios:  troca  = so a A esta no limite -> troca pra B e retoma
 //            ambas  = A e B no limite ate um horario -> espera renovar, retoma (leva ~2 min)
+//            revogada = o servidor devolve 403 "OAuth token has been revoked" na A -> authentication_failed -> segue na B
 //            aviso  = o Claude Code AVISA o limite antes de estourar (nota wrap_up no transcript, turno termina normal,
 //                     sem 429): o hook Stop tem que trocar e acordar a sessao
 //
@@ -85,13 +86,17 @@ async function cenario(nome) {
   // "ambas": o limite acaba num minuto cheio ~1-2 min a frente (o aviso so tem precisao de minuto)
   const agoraS = Math.floor(Date.now() / 1000);
   const resetEpoch = nome === 'ambas' ? (Math.floor(agoraS / 60) + 2) * 60 : agoraS + 3 * 3600;
-  const livre = (auth) => (nome === 'aviso' ? true : nome === 'troca' ? auth.endsWith('acc-B') : Date.now() >= resetEpoch * 1000);
+  const livre = (auth) => (nome === 'aviso' ? true : nome === 'troca' || nome === 'revogada' ? auth.endsWith('acc-B') : Date.now() >= resetEpoch * 1000);
   const server = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
       const auth = req.headers.authorization || '';
       reqs.push({ m: req.method, url: req.url, auth, at: Date.now() });
       if (req.method === 'POST' && req.url.startsWith('/v1/messages') && !req.url.includes('count_tokens')) {
+        if (!livre(auth) && nome === 'revogada') { // o que o servidor real devolve quando o token de renovacao foi reusado
+          res.writeHead(403, { 'content-type': 'application/json', 'x-should-retry': 'false' });
+          return res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'OAuth token has been revoked. Please obtain a new token or refresh your existing token.' } }));
+        }
         if (!livre(auth)) {
           res.writeHead(429, {
             'content-type': 'application/json', 'retry-after': String(resetEpoch - Math.floor(Date.now() / 1000)), 'x-should-retry': 'false',
@@ -120,7 +125,7 @@ async function cenario(nome) {
   const dumpHook = path.join(base, 'dump-hook.js');
   fs.writeFileSync(dumpHook, `require('fs').appendFileSync(${JSON.stringify(dump)}, require('fs').readFileSync(0,'utf8').replace(/\\s+/g,' ') + '\\n')`);
   const settingsExtra = path.join(base, 'settings-extra.json');
-  const hooksExtra = { StopFailure: [{ matcher: 'rate_limit', hooks: [{ type: 'command', command: `node "${dumpHook}"` }] }] };
+  const hooksExtra = { StopFailure: [{ matcher: nome === 'revogada' ? 'authentication_failed' : 'rate_limit', hooks: [{ type: 'command', command: `node "${dumpHook}"` }] }] };
   if (nome === 'aviso') {
     // Imita o cliente: 1 s apos o pedido (resposta ainda em andamento) grava a nota "wrap_up" e a linha de reset no
     // transcript. Formato copiado de uma sessao real. So na 1a vez, senao a retomada ganharia outra nota.
@@ -174,7 +179,10 @@ async function cenario(nome) {
 
   try {
     if (nome === 'aviso') assert.equal(entradas.length, 0, 'nao houve 429: o StopFailure nao pode ter disparado');
-    else {
+    else if (nome === 'revogada') {
+      assert.ok(entradas.length >= 1 && entradas.every((e) => e.error === 'authentication_failed'), 'o Claude Code classificou o 403 "token revogado" como authentication_failed e chamou o hook');
+      ok('o 403 "OAuth token has been revoked" virou StopFailure/authentication_failed e o hook do plugin foi chamado');
+    } else {
       assert.ok(entradas.length >= 1 && entradas.every((e) => e.error === 'rate_limit'), 'o Claude Code classificou o 429 como rate_limit e chamou o hook');
       ok('o 429 virou StopFailure/rate_limit e o hook do plugin foi chamado');
     }
@@ -184,11 +192,17 @@ async function cenario(nome) {
     assert.equal(credFinal.mcpOAuth.servidorX.accessToken, 'MCP-INTACTO');
     ok('tokens de MCP intactos; caminho com espacos funcionou');
 
-    if (nome === 'troca' || nome === 'aviso') {
+    if (nome === 'troca' || nome === 'aviso' || nome === 'revogada') {
       assert.deepEqual([seq[0], seq[seq.length - 1]], ['A', 'B'], 'primeiro pedido na A, ultimo na B');
       ok('a sessao ABERTA passou a usar o token da conta B apos a troca');
       if (nome === 'aviso') assert.match(log, /AVISO de limite antes de estourar[^\n]*\n[^\n]*TROCOU \(aviso\): a@teste\.com -> b@teste\.com/);
-      else assert.match(log, /TROCOU \(limite\): a@teste\.com -> b@teste\.com/);
+      else if (nome === 'revogada') {
+        assert.match(log, /TROCOU \(revogada\): a@teste\.com -> b@teste\.com/);
+        const st = JSON.parse(fs.readFileSync(path.join(CFG, 'contas', 'estado.json'), 'utf8'));
+        assert.equal(st._revogadas['a@teste.com'].length >= 1, true, 'a conta A ficou marcada como revogada');
+        assert.match(node(['status']).stdout, /a@teste\.com.*PRECISA DE \/login \(revogada\)/);
+        ok('a A ficou marcada como revogada e a sessao seguiu na B');
+      } else assert.match(log, /TROCOU \(limite\): a@teste\.com -> b@teste\.com/);
       assert.equal(credFinal.claudeAiOauth.accessToken, 'acc-B');
       assert.equal(JSON.parse(fs.readFileSync(path.join(CFG, '.claude.json'), 'utf8')).oauthAccount.emailAddress, 'b@teste.com');
       ok('login e identidade ficaram na B');
@@ -205,13 +219,14 @@ async function cenario(nome) {
     assert.ok(respostas <= 2, 'sem retomadas duplicadas (o stream repete o texto em 2 eventos)');
     ok('sem retomada duplicada');
   } finally {
-    try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 80, retryDelay: 500 }); } catch { console.log('  (nao consegui apagar ' + base + ', apague na mao)'); }
+    if (process.env.E2E_FICAR) console.log('  (E2E_FICAR: pasta mantida em ' + base + ')');
+    else try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 80, retryDelay: 500 }); } catch { console.log('  (nao consegui apagar ' + base + ', apague na mao)'); }
   }
 }
 
 (async () => {
   const pedido = process.argv[2];
-  const lista = pedido ? [pedido] : ['troca', 'aviso', 'ambas'];
+  const lista = pedido ? [pedido] : ['troca', 'aviso', 'revogada', 'ambas'];
   for (const n of lista) await cenario(n);
   console.log('\nE2E OK');
   process.exit(0);

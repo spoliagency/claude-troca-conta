@@ -14,8 +14,9 @@
 //   status                     contas guardadas, a ativa e os limites
 //   lembrete                   aviso de inicio de sessao (hook SessionStart), mudo quando esta tudo certo
 //   trocar [email] [--dry]     troca de conta agora (manual)
-//   trocar --hook              modo hook StopFailure/rate_limit (le o JSON do stdin)
-//   parou                      modo hook Stop: o limite foi AVISADO antes de estourar (le o transcript)
+//   trocar --hook              modo hook StopFailure: rate_limit (troca) e authentication_failed (login revogado)
+//   parou                      modo hook Stop: guarda o login renovado e trata o limite AVISADO antes de estourar
+//   sincronizar                guarda de novo o login da conta ativa, se o Claude Code o renovou
 //   diagnosticar               confere o ambiente, sem alterar nada
 //   esquecer <email>           apaga uma conta guardada
 //   config [chave valor]       mostra ou muda: esperar, maxEsperaHoras, mac, lembrete, antecipar
@@ -23,6 +24,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const { lerJson, gravar, hhmm, caminhos, criarLog } = require('./lib/util');
 const { lerReset } = require('./lib/reset');
@@ -53,6 +55,16 @@ const limitada = (st, email, agora) => !!(st[email] && st[email].limiteAte && ne
 const precisaLogin = (s) => !!(s.claudeAiOauth.refreshTokenExpiresAt && s.claudeAiOauth.refreshTokenExpiresAt < Date.now());
 const proximaVolta = (st, emails) => Math.min(...emails.map((e) => new Date(st[e].limiteAte).getTime()));
 
+// Login revogado pelo servidor (o token de renovacao so vale uma vez; reusar um gasto derruba a conta toda).
+// Guarda so o hash dos tokens mortos: quando a conta ganha token novo (/login, ou o sync abaixo), a marca some sozinha.
+const hash = (t) => crypto.createHash('sha256').update(String(t || '')).digest('hex').slice(0, 16);
+const revogada = (st, s) => !!(st._revogadas && (st._revogadas[s.email] || []).includes(hash(s.claudeAiOauth.refreshToken)));
+const morta = (st, s) => precisaLogin(s) || revogada(st, s);
+function marcarRevogada(st, email, tokens) {
+  st._revogadas = st._revogadas || {};
+  st._revogadas[email] = [...new Set([...(st._revogadas[email] || []), ...tokens.filter(Boolean).map(hash)])].slice(-6);
+}
+
 function atual() {
   const store = escolherStore(P, process.env, CFG);
   const cred = store.ler();
@@ -69,10 +81,45 @@ function guardar(a) {
   gravar(slot(a.email), { v: 2, email: a.email, salvoEm: new Date().toISOString(), claudeAiOauth: a.oauth, oauthAccount: a.conta, extras });
 }
 
+// O token de renovacao muda a cada renovacao do Claude Code. Se o slot so fosse gravado na hora de SAIR da conta,
+// ele ficaria dias atras e a proxima troca para ela usaria um token ja gasto (revogado). Por isso o slot da conta
+// ativa acompanha o login a cada turno. So atualiza conta que ela ja cadastrou; nunca cria slot.
+function sincronizar() {
+  let a;
+  try { a = atual(); } catch { return; }
+  const f = slot(a.email);
+  if (!fs.existsSync(f)) return;
+  const s = lerOpcional(f);
+  if (!s.claudeAiOauth) return;
+  const o = a.oauth; const g = s.claudeAiOauth;
+  // O Claude Code zera o refreshToken do arquivo quando a renovacao falha. Login sem token de renovacao nao e
+  // login novo: nunca grava por cima de um slot que ainda pode estar bom.
+  if (!o.refreshToken) return;
+  if (g.accessToken === o.accessToken && g.refreshToken === o.refreshToken) return;
+
+  // Nao sincroniza no escuro: ou o login lido e de OUTRA conta guardada (arquivo regravado por uma sessao antiga,
+  // ou lido no meio de uma troca), ou e mais velho que o slot. Nos dois casos o slot atual vale mais.
+  const dona = contasGuardadas().find((c) => c.email !== a.email && c.claudeAiOauth.refreshToken === o.refreshToken);
+  const velho = !dona && g.expiresAt && o.expiresAt && o.expiresAt < g.expiresAt;
+  if (dona || velho) {
+    // Arquivo proprio: o sync roda em todo turno de toda sessao, sem a trava de troca, e uma gravacao do estado.json
+    // inteiro aqui poderia apagar a marca de limite que um hook de troca acabou de gravar.
+    const arq = path.join(P.dir, 'sync.json');
+    const chave = `${dona ? 'outra:' + dona.email : 'velho'}:${hash(o.refreshToken)}`;
+    if (lerOpcional(arq).pulo !== chave) { // loga uma vez por situacao, nao a cada turno
+      log(`SYNC pulado em ${a.email}: ${dona ? `o login lido e o da conta ${dona.email}` : 'o login lido e mais velho que o guardado'}`);
+      gravar(arq, { pulo: chave });
+    }
+    return;
+  }
+  guardar(a);
+  log(`SYNC: login de ${a.email} guardado de novo (token renovado desde o ultimo salvamento)`);
+}
+
 function contasGuardadas() {
   if (!fs.existsSync(P.dir)) return [];
   return fs.readdirSync(P.dir)
-    .filter((f) => f.endsWith('.json') && f !== 'estado.json' && f !== 'config.json')
+    .filter((f) => f.endsWith('.json') && !['estado.json', 'config.json', 'sync.json'].includes(f))
     .map((f) => { try { return lerJson(path.join(P.dir, f)); } catch { return null; } })
     .filter((s) => s && s.email && s.claudeAiOauth)
     .sort((x, y) => x.email.localeCompare(y.email));
@@ -85,8 +132,8 @@ function acordar(texto) {
   setTimeout(() => process.exit(2), ACORDAR_MS);
 }
 
-function aplicar(a, alvo, st, sessao, motivo = 'manual') {
-  guardar(a); // o token pode ter sido renovado desde o ultimo "salvar"
+function aplicar(a, alvo, st, sessao, motivo = 'manual', guardarAtual = true) {
+  if (guardarAtual && a.oauth.refreshToken) guardar(a); // o token pode ter sido renovado desde o ultimo "salvar"; login sem token de renovacao nao e guardado
   const credAntes = a.store.ler();
   const cred = JSON.parse(JSON.stringify(credAntes));
   cred.claudeAiOauth = alvo.claudeAiOauth;
@@ -143,13 +190,14 @@ const soltarTrava = (f = TRAVA) => { try { fs.unlinkSync(f); } catch { /* ja sol
 
 // Decide e executa a troca da retomada com a trava na mao. Devolve o que fazer depois de soltar a trava.
 function decidirRetomada(sessao, inicio) {
+  try { sincronizar(); } catch (e) { log(`ERRO sincronizando: ${e.message}`); } // horas de espera: o /login pode ter acontecido nesse meio tempo
   const a = atual();
   const st = estado();
   const agora = Date.now();
   // Outro hook (outra espera, outra sessao) ja trocou/retomou depois que comecei a esperar.
   if (st._ultimaTroca && st._ultimaTroca > inicio) return { sair: 'espera encerrada: ja foi retomado por outro hook' };
 
-  const todas = contasGuardadas().filter((s) => !precisaLogin(s) || s.email === a.email);
+  const todas = contasGuardadas().filter((s) => !morta(st, s) || (s.email === a.email && !revogada(st, s)));
   const livres = todas.filter((s) => !limitada(st, s.email, agora));
   const alvo = livres.find((s) => s.email === a.email) || livres[0]; // prefere ficar: trocar custa um refresh
   if (!alvo) { // a marcacao mudou enquanto eu esperava
@@ -191,8 +239,75 @@ function trocar(opcoes) {
   try { trocarSemTrava({ ...opcoes, entradaPronta: entrada }); } finally { if (pegou) soltarTrava(TRAVA_TROCA); }
 }
 
+// A conta que a sessao usa teve o login revogado (token de renovacao reusado ou invalidado no servidor). So um
+// /login resolve essa conta; ate la a sessao segue em outra, em vez de parar pedindo login.
+function falhaLogin(entrada) {
+  const a = atual();
+  const st = estado();
+  const agora = Date.now();
+
+  // Outra sessao falhou na conta antiga logo apos uma troca: o login ja mudou, so falta acordar. So vale se o login
+  // ativo parece inteiro; com o refreshToken zerado o Claude Code acabou de falhar nesta conta mesma (a nova), e
+  // acordar a sessao so repetiria a falha.
+  const recente = st._ultimaTroca && agora - st._ultimaTroca < ANTI_PINGPONG_MS;
+  if (recente && st._sessao !== entrada.session_id && a.oauth.refreshToken) {
+    log(`login revogado em outra sessao (${entrada.session_id}); a conta ja foi trocada, esta em ${a.email}`);
+    acordar(`[troca-conta] a conta desta sessao ja foi trocada para ${a.email}. ${RETOMAR}`);
+    return;
+  }
+
+  // authentication_failed tambem sai de falha passageira. Marcar uma conta boa como morta a tira da troca ate o
+  // proximo /login, entao so marca com prova: o Claude Code zerou o refreshToken (renovacao falhou de fato) ou a
+  // mensagem diz que o login foi revogado/vencido. Sem prova, nao mexe (volta ao comportamento de antes).
+  const texto = `${entrada.last_assistant_message || ''} ${entrada.error_details || ''}`;
+  if (a.oauth.refreshToken && !/revoked|could not be refreshed|run \/login|log in again|session expired/i.test(texto)) {
+    log(`authentication_failed sem sinal de login revogado em ${a.email}; nao marquei nada: ${texto.trim().slice(0, 120)}`);
+    return;
+  }
+
+  // O slot da mesma conta e da mesma familia de tokens: se o atual morreu, ele tambem. O Claude Code ja zerou o
+  // refreshToken do arquivo (renovacao falhou), entao e o slot que carrega o token a marcar; por isso a troca
+  // abaixo NAO grava o login atual por cima dele.
+  const guardado = lerOpcional(slot(a.email)).claudeAiOauth;
+  marcarRevogada(st, a.email, [a.oauth.refreshToken, guardado && guardado.refreshToken]);
+
+  const outras = contasGuardadas().filter((s) => s.email !== a.email && !morta(st, s));
+  if (!outras.length) {
+    const msg = `${a.email} precisa de /login (login revogado) e nao ha outra conta guardada com login valido`;
+    log(`FALHOU: ${msg}`);
+    gravar(P.estado, st);
+    avisar('Claude: conta sem login', msg);
+    process.exitCode = 1;
+    return;
+  }
+
+  const livres = outras.filter((s) => !limitada(st, s.email, agora));
+  const pedido = `faca /login em ${a.email} quando puder (so ela precisa)`;
+  if (livres.length) {
+    const alvo = livres[0];
+    aplicar(a, alvo, st, entrada.session_id, 'revogada', false);
+    log(`TROCOU (revogada): ${a.email} -> ${alvo.email}`);
+    avisar(`Claude: ${a.email} precisa de /login`, `Troquei para ${alvo.email} e a sessao continua. Faca o /login em ${a.email} quando puder.`);
+    acordar(`[troca-conta] o login de ${a.email} foi revogado; a sessao ja esta na conta ${alvo.email}. ${RETOMAR} Avise a usuaria em uma linha: ${pedido}.`);
+    return;
+  }
+
+  // As outras estao no limite: fica na que renova primeiro e espera, como no caso de todas no limite.
+  const hora = (s) => new Date(st[s.email].limiteAte).getTime();
+  const primeira = outras.reduce((m, s) => (hora(s) < hora(m) ? s : m));
+  aplicar(a, primeira, st, entrada.session_id, 'revogada', false);
+  log(`TROCOU (revogada, no limite ate ${hhmm(hora(primeira))}): ${a.email} -> ${primeira.email}`);
+  if (!CFG.esperar || hora(primeira) - agora > MAX_ESPERA_MS) {
+    avisar(`Claude: ${a.email} precisa de /login`, `${primeira.email} esta no limite ate ${hhmm(hora(primeira))}. ${pedido}.`);
+    return;
+  }
+  avisar(`Claude: ${a.email} precisa de /login`, `Troquei para ${primeira.email}, que volta ${hhmm(hora(primeira))}. Volto sozinho. Faca o /login em ${a.email} quando puder.`);
+  aguardar(hora(primeira), entrada.session_id, st._ultimaTroca);
+}
+
 function trocarSemTrava({ hook, dry, para, entradaPronta }) {
   const entrada = hook ? (entradaPronta || lerStdin()) : {};
+  if (hook && entrada.error === 'authentication_failed') return falhaLogin(entrada);
   if (hook && entrada.error && entrada.error !== 'rate_limit') return;
 
   const a = atual();
@@ -221,12 +336,14 @@ function trocarSemTrava({ hook, dry, para, entradaPronta }) {
   const guardadas = contasGuardadas();
   let outras = guardadas.filter((s) => s.email !== a.email);
   if (para) outras = outras.filter((s) => s.email.toLowerCase() === para.toLowerCase());
-  const vencidas = outras.filter(precisaLogin);
-  outras = outras.filter((s) => !precisaLogin(s));
+  // Troca manual para um e-mail escolhido ignora a marca de revogada (a decisao e dela); so o vencimento barra.
+  const barrada = (s) => (para ? precisaLogin(s) : morta(st, s));
+  const vencidas = outras.filter(barrada);
+  outras = outras.filter((s) => !barrada(s));
 
   if (!outras.length) {
     const msg = vencidas.length
-      ? `a(s) conta(s) ${vencidas.map((s) => s.email).join(', ')} precisa(m) de /login de novo (o token de renovacao venceu)`
+      ? `a(s) conta(s) ${vencidas.map((s) => s.email).join(', ')} precisa(m) de /login de novo (o token de renovacao venceu ou foi revogado)`
       : `so ha uma conta guardada (${a.email}); logue na outra e rode "salvar"`;
     log(`FALHOU: ${msg}`);
     if (hook) avisar('Claude: limite atingido, sem conta pra trocar', msg); else console.error(msg);
@@ -328,6 +445,7 @@ function acharNotaDeLimite(transcript) {
 
 function parou() {
   const entrada = lerStdin();
+  try { sincronizar(); } catch (e) { log(`ERRO sincronizando: ${e.message}`); } // todo turno; nunca atrapalha o resto
   if (CFG.antecipar === false || !entrada.transcript_path) return;
   let nota;
   try { nota = acharNotaDeLimite(entrada.transcript_path); } catch { return; } // transcript ilegivel: nao e problema de conta
@@ -355,7 +473,12 @@ function parou() {
 
 function dias(ms) { return Math.floor((ms - Date.now()) / 864e5); }
 
+// Quem le o estado das contas (status, guia, ensaio, diagnostico) sincroniza antes: depois de um /login a marca de
+// revogada so some quando o slot recebe o token novo, e isso nao pode esperar o fim do proximo turno.
+function sincronizarSilencioso() { try { sincronizar(); } catch (e) { log(`ERRO sincronizando: ${e.message}`); } }
+
 function status() {
+  sincronizarSilencioso();
   let ativa = null;
   try { ativa = atual().email; } catch (e) { console.log('logada agora: ninguem (' + e.message + ')'); }
   const st = estado();
@@ -364,7 +487,7 @@ function status() {
   for (const s of lista) {
     const lim = limitada(st, s.email, Date.now()) ? `no limite ate ${hhmm(st[s.email].limiteAte)}` : 'livre';
     const r = s.claudeAiOauth.refreshTokenExpiresAt;
-    const login = r ? (precisaLogin(s) ? 'PRECISA DE /login' : `login vale +${dias(r)}d`) : '';
+    const login = revogada(st, s) ? 'PRECISA DE /login (revogada)' : r ? (precisaLogin(s) ? 'PRECISA DE /login' : `login vale +${dias(r)}d`) : '';
     console.log(`${s.email === ativa ? '*' : ' '} ${s.email}  ${s.claudeAiOauth.subscriptionType || '?'}  ${lim}  ${login}`);
   }
   const u = st._ultima;
@@ -376,12 +499,13 @@ function status() {
 // Onde a pessoa esta no cadastro, lido do estado REAL (login, contas guardadas, ensaio), nunca da conversa.
 // n = 1..4 e o passo que falta; n = 5 quer dizer pronto.
 function progresso() {
+  sincronizarSilencioso();
   let a = null; let erro = null;
   try { a = atual(); } catch (e) { erro = e.message; }
   const lista = contasGuardadas();
   const st = estado();
   const emails = lista.map((s) => s.email).sort();
-  const vencidas = lista.filter(precisaLogin);
+  const vencidas = lista.filter((s) => morta(st, s));
   const ativaGuardada = !!a && lista.some((s) => s.email === a.email);
   const ens = st._ensaio;
   const ensaioOk = !!(ens && ens.ok && JSON.stringify(ens.contas) === JSON.stringify(emails));
@@ -423,7 +547,7 @@ function guia() {
   } else if (g.n === 2) {
     agora = `Rode: salvar   (guarda ${g.a.email}). Depois rode guia de novo.`;
   } else if (g.n === 3) {
-    if (g.vencidas.length) agora = `${g.vencidas.map((s) => s.email).join(', ')} precisa de /login de novo (o token de renovacao venceu). Peca /login nessa conta e rode: salvar`;
+    if (g.vencidas.length) agora = `${g.vencidas.map((s) => s.email).join(', ')} precisa de /login de novo (o token de renovacao venceu ou foi revogado). Peca /login nessa conta; o plugin guarda o login novo sozinho no proximo turno.`;
     else if (!g.ativaGuardada) agora = `A conta ativa (${g.a.email}) ainda nao esta guardada. Rode: salvar   Depois rode guia de novo.`;
     else agora = `So ha 1 conta guardada (${g.a.email}). Peca a pessoa para digitar /login e entrar na OUTRA conta (nunca /logout). Voce NAO consegue fazer o login por ela. Quando ela avisar que terminou, rode guia de novo.`;
   } else if (!g.ativaGuardada) {
@@ -440,15 +564,17 @@ function guia() {
 // Prova que a troca funciona NESTA maquina sem esperar um limite de verdade: vai para cada outra conta
 // guardada e volta, conferindo login e identidade lidos de volta nos dois sentidos.
 function ensaio() {
+  sincronizarSilencioso();
   const a = atual();
   const guardadas = contasGuardadas();
   if (!guardadas.some((s) => s.email === a.email)) throw new Error(`a conta ativa (${a.email}) ainda nao esta guardada; rode "salvar" antes`);
-  const vencidas = guardadas.filter(precisaLogin);
+  const stInicial = estado(); // uma leitura so, pro veredito nao mudar no meio da execucao
+  const vencidas = guardadas.filter((s) => morta(stInicial, s));
   if (vencidas.length) throw new Error(`${vencidas.map((s) => s.email).join(', ')} precisa(m) de /login de novo; faca o login nela e rode "salvar"`);
   const outras = guardadas.filter((s) => s.email !== a.email);
   if (!outras.length) throw new Error('so ha uma conta guardada; o ensaio precisa de uma segunda');
 
-  const stAntes = estado();
+  const stAntes = stInicial;
   const st = JSON.parse(JSON.stringify(stAntes));
   const credAntes = a.store.ler();
   const identAntes = lerJson(P.ident);
@@ -483,6 +609,7 @@ function ensaio() {
 // Aviso curto no inicio da sessao enquanto o cadastro nao estiver completo. Silencioso quando esta tudo certo
 // e quando algo falha (um lembrete nunca pode atrapalhar a abertura da sessao).
 function lembrete() {
+  try { sincronizar(); } catch { /* idem */ }
   try {
     if (CFG.lembrete === false) return;
     const g = progresso();
@@ -532,9 +659,11 @@ function diagnosticar() {
   const lista = contasGuardadas();
   if (lista.length < 2) aviso(`so ${lista.length} conta(s) guardada(s); a troca precisa de pelo menos 2 (logue na outra com /login e rode "salvar")`);
   else ok(`${lista.length} contas guardadas`);
+  const stDiag = estado();
   for (const s of lista) {
     const r = s.claudeAiOauth.refreshTokenExpiresAt;
-    if (precisaLogin(s)) ruim(`${s.email}: token de renovacao VENCIDO, faca /login nela e "salvar"`);
+    if (revogada(stDiag, s)) ruim(`${s.email}: login REVOGADO, faca /login nela (o plugin guarda o novo sozinho)`);
+    else if (precisaLogin(s)) ruim(`${s.email}: token de renovacao VENCIDO, faca /login nela (o plugin guarda o novo sozinho)`);
     else if (r && dias(r) < 7) aviso(`${s.email}: token de renovacao vence em ${dias(r)} dias`);
     if (s.v !== 2) aviso(`${s.email}: guardada em formato antigo; rode "salvar" logado nela para atualizar`);
   }
@@ -574,13 +703,14 @@ try {
   else if (cmd === 'status') status();
   else if (cmd === 'trocar') trocar({ hook: flags.includes('--hook'), dry: flags.includes('--dry'), para: args.find((x) => x.includes('@')) });
   else if (cmd === 'parou') parou();
+  else if (cmd === 'sincronizar') { sincronizar(); console.log('ok'); }
   else if (cmd === 'diagnosticar') diagnosticar();
   else if (cmd === 'guia') guia();
   else if (cmd === 'ensaio') ensaio();
   else if (cmd === 'lembrete') lembrete();
   else if (cmd === 'config') configCmd(args[0], args[1]);
   else if (cmd === 'esquecer') esquecer(args[0]);
-  else console.log('uso: guia | salvar | status | trocar [email] [--dry] | trocar --hook | parou | ensaio | diagnosticar | esquecer <email> | config [chave valor] | lembrete');
+  else console.log('uso: guia | salvar | sincronizar | status | trocar [email] [--dry] | trocar --hook | parou | ensaio | diagnosticar | esquecer <email> | config [chave valor] | lembrete');
 } catch (e) {
   log(`ERRO ${cmd}: ${e.message}`);
   console.error('erro: ' + e.message);

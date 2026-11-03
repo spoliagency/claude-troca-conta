@@ -50,7 +50,21 @@ o limite e AVISADO antes de estourar (o modelo para sozinho, turno termina norma
 as duas no limite
    -> descobre qual das contas renova PRIMEIRO e ja troca pra ela na hora (se for a atual, fica)
    -> o hook fica vivo, conferindo a hora a cada 30 s, ate ela renovar (max 5h30), e entao acorda a sessao
+a conta ativa tem o login REVOGADO (hook StopFailure, matcher authentication_failed)
+   -> marca a conta como revogada, troca pra outra conta que esteja livre (ou espera a que renova primeiro) e acorda a sessao
+   -> avisa que so aquela conta precisa de /login; quando ela fizer, o plugin guarda o login novo e a marca some
+a cada turno (hook Stop), ao abrir ou retomar a sessao, e ao rodar status/guia/ensaio
+   -> se o Claude Code renovou o token da conta ativa, o slot guardado dela e atualizado
 ```
+
+So marca como revogada com prova: o Claude Code zerou o `refreshToken` do arquivo (a renovacao falhou de fato) ou a
+mensagem diz que o login foi revogado/venceu. Um `authentication_failed` passageiro (rede, por exemplo) nao marca nada.
+
+**Por que o slot acompanha o login:** o token de renovacao so vale uma vez. Cada renovacao gera um novo e invalida o
+anterior, e reusar um ja gasto faz o servidor revogar a conta toda. Se o slot so fosse gravado na hora de sair da
+conta, ele ficaria dias atras e a proxima troca para ela usaria um token gasto (foi o que revogou a conta em 03/11).
+O sync nao grava no escuro: pula se o login lido for o de outra conta guardada (arquivo regravado por sessao antiga
+ou lido no meio de uma troca) ou se for mais velho que o slot, e nunca cria slot de conta nao cadastrada.
 
 Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`.
 
@@ -62,6 +76,7 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 |---|---|
 | `guia` | onde voce esta no cadastro (passo X de 4) e o que fazer agora; `ESTADO: PRONTO` ao final |
 | `salvar` | guarda a conta logada agora |
+| `sincronizar` | guarda de novo o login da conta ativa se o Claude Code o renovou (o hook faz isso a cada turno) |
 | `ensaio` | troca para cada outra conta e volta, conferindo (prova que funciona nesta maquina) |
 | `status` | contas guardadas, a ativa, quem esta no limite e ate quando, validade do login, ultima troca |
 | `trocar [email] [--dry]` | troca na mao |
@@ -84,7 +99,14 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 - **Fuso horario**: o aviso do Claude traz a hora de renovacao com o fuso (`resets 6:27pm (America/Sao_Paulo)`);
   e convertida certo mesmo se a maquina estiver em outro fuso.
 - **`trustedDeviceToken`**: pertence a conta+dispositivo; acompanha a conta na troca.
-- **Token de renovacao vencido** numa conta guardada: a conta e pulada e o aviso diz para fazer `/login` nela.
+- **Token de renovacao vencido ou login revogado** numa conta guardada: a conta e pulada e o aviso diz para fazer `/login` nela.
+  A marca de revogada e o hash do token morto, entao some sozinha quando a conta ganha token novo. Troca manual
+  (`trocar <email>`) ignora a marca: a decisao e sua.
+- **Limite do sync:** o login nao traz o e-mail da conta, so a identidade do `.claude.json` diz de quem ele e. Se uma
+  sessao antiga da conta B renovar e regravar o arquivo enquanto a identidade ja e da A, o sync nao tem como saber (so
+  barra quando o token lido e o de outra conta guardada, ou e mais velho que o slot). Feche sessoes esquecidas.
+- **Nao da pra impedir** que uma sessao antiga do Claude Code, aberta antes da troca, regrave o proprio login no
+  arquivo (o plugin so detecta e nao sobrescreve o slot com ele). Feche sessoes `claude` esquecidas.
 - **Varias sessoes abertas**: dividem o mesmo login; uma sessao vizinha so e acordada, sem marcar a conta nova
   como no limite por engano. Varias esperas simultaneas: uma trava de arquivo garante que so uma troca e acorda.
 - **Gravacao ruim**: o script le de volta e compara; se nao bater, restaura o login anterior.
