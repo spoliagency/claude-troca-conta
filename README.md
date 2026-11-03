@@ -53,9 +53,12 @@ as duas no limite
 a conta ativa tem o login REVOGADO (hook StopFailure, matcher authentication_failed)
    -> marca a conta como revogada, troca pra outra conta que esteja livre (ou espera a que renova primeiro) e acorda a sessao
    -> avisa que so aquela conta precisa de /login; quando ela fizer, o plugin guarda o login novo e a marca some
-a cada turno (hook Stop) e ao abrir a sessao
+a cada turno (hook Stop), ao abrir ou retomar a sessao, e ao rodar status/guia/ensaio
    -> se o Claude Code renovou o token da conta ativa, o slot guardado dela e atualizado
 ```
+
+So marca como revogada com prova: o Claude Code zerou o `refreshToken` do arquivo (a renovacao falhou de fato) ou a
+mensagem diz que o login foi revogado/venceu. Um `authentication_failed` passageiro (rede, por exemplo) nao marca nada.
 
 **Por que o slot acompanha o login:** o token de renovacao so vale uma vez. Cada renovacao gera um novo e invalida o
 anterior, e reusar um ja gasto faz o servidor revogar a conta toda. Se o slot so fosse gravado na hora de sair da
@@ -99,6 +102,9 @@ Cada troca gera um aviso do sistema e uma linha em `~/.claude/contas/trocas.log`
 - **Token de renovacao vencido ou login revogado** numa conta guardada: a conta e pulada e o aviso diz para fazer `/login` nela.
   A marca de revogada e o hash do token morto, entao some sozinha quando a conta ganha token novo. Troca manual
   (`trocar <email>`) ignora a marca: a decisao e sua.
+- **Limite do sync:** o login nao traz o e-mail da conta, so a identidade do `.claude.json` diz de quem ele e. Se uma
+  sessao antiga da conta B renovar e regravar o arquivo enquanto a identidade ja e da A, o sync nao tem como saber (so
+  barra quando o token lido e o de outra conta guardada, ou e mais velho que o slot). Feche sessoes esquecidas.
 - **Nao da pra impedir** que uma sessao antiga do Claude Code, aberta antes da troca, regrave o proprio login no
   arquivo (o plugin so detecta e nao sobrescreve o slot com ele). Feche sessoes `claude` esquecidas.
 - **Varias sessoes abertas**: dividem o mesmo login; uma sessao vizinha so e acordada, sem marcar a conta nova

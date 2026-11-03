@@ -192,6 +192,41 @@ test('a troca por limite tambem nao guarda um login sem refreshToken', (t) => {
   assert.equal(w.slot('b@x.com').claudeAiOauth.refreshToken, 'ref-B');
 });
 
+test('authentication_failed sem sinal de login revogado (falha passageira): nao marca nem troca', (t) => {
+  const w = duasContas(); t.after(w.limpar);
+  const r = w.run(['trocar', '--hook'], w.hookIn('API Error: connection reset', 's1', 'authentication_failed'));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(w.quem(), 'b@x.com');
+  assert.equal(fs.existsSync(path.join(w.contas, 'estado.json')), false, 'nao gravou marca nenhuma');
+  assert.match(w.log(), /sem sinal de login revogado/);
+});
+
+test('sessao vizinha cujo login ATIVO esta zerado falhou na conta nova: marca a nova em vez de acordar em loop', (t) => {
+  const w = criarMundo(); t.after(w.limpar);
+  for (const [e, k] of [['a@x.com', 'A'], ['b@x.com', 'B'], ['c@x.com', 'C']]) { w.logar(e, k); w.run(['salvar']); }
+  falhaLogin(w, 's1'); // C morre, a sessao vai pra A (primeira livre)
+  assert.equal(w.quem(), 'a@x.com');
+  zerarRefresh(w); // agora e a A que falha, em outra sessao, dentro dos 60 s
+  const r = falhaLogin(w, 's2');
+  assert.equal(r.status, 2, r.stderr);
+  assert.equal(w.quem(), 'b@x.com', 'seguiu pra B em vez de so acordar na A morta');
+  assert.ok(w.estado()._revogadas['a@x.com'], 'A marcada');
+});
+
+test('o aviso de sync pulado nao toca no estado.json (o sync roda sem a trava de troca)', (t) => {
+  const w = duasContas(); t.after(w.limpar);
+  w.mudarSlot('b@x.com', (s) => { s.claudeAiOauth.refreshToken = 'ref-B-novo'; s.claudeAiOauth.expiresAt = Date.now() + 9 * 3600e3; });
+  w.run(['sincronizar']);
+  assert.equal(fs.existsSync(path.join(w.contas, 'estado.json')), false);
+  assert.equal(fs.existsSync(path.join(w.contas, 'sync.json')), true);
+});
+
+test('o hook de inicio de sessao tambem roda no resume', () => {
+  const hooks = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'hooks', 'hooks.json'), 'utf8'));
+  const m = hooks.hooks.SessionStart[0].matcher;
+  assert.ok(new RegExp(`^(${m})$`).test('resume') && new RegExp(`^(${m})$`).test('startup'), m);
+});
+
 // ---------- 3. recuperacao ----------
 
 test('/login novo na conta revogada: o sync guarda o token e a marca some sozinha', (t) => {
@@ -199,9 +234,7 @@ test('/login novo na conta revogada: o sync guarda o token e a marca some sozinh
   falhaLogin(w); // ativa A, B morta
   // ela faz /login em B: o Claude Code grava login e identidade novos
   w.logar('b@x.com', 'B-NOVO');
-  const antes = w.run(['status']).stdout;
-  assert.match(antes, /b@x\.com.*PRECISA DE \/login \(revogada\)/, 'ainda marcada: o slot guarda o token morto');
-  w.run(['sincronizar']);
+  // sem esperar o proximo turno: quem le o estado (status/guia/ensaio) sincroniza antes
   const depois = w.run(['status']).stdout;
   assert.doesNotMatch(depois, /PRECISA DE/);
   assert.equal(w.slot('b@x.com').claudeAiOauth.refreshToken, 'ref-B-NOVO');

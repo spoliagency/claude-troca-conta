@@ -143,7 +143,8 @@ test('hooks.json: JSON valido, StopFailure acorda a sessao e todo script citado 
   const h = JSON.parse(fs.readFileSync(path.join(raiz, 'hooks', 'hooks.json'), 'utf8')).hooks;
   assert.equal(h.StopFailure[0].matcher, 'rate_limit'); assert.equal(h.StopFailure[0].hooks[0].asyncRewake, true);
   assert.ok(h.StopFailure[0].hooks[0].timeout > 5.5 * 3600, 'timeout maior que a espera maxima');
-  assert.equal(h.SessionStart[0].matcher, 'startup');
+  assert.equal(h.StopFailure[1].matcher, 'authentication_failed'); assert.equal(h.StopFailure[1].hooks[0].asyncRewake, true);
+  assert.equal(h.SessionStart[0].matcher, 'startup|resume');
   const cmds = Object.values(h).flat().flatMap((g) => g.hooks.map((x) => x.command));
   for (const c of cmds) {
     const rel = /\$\{CLAUDE_PLUGIN_ROOT\}\/([^"]+)"/.exec(c)[1];
