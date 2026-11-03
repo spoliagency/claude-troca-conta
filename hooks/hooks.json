@@ -11,6 +11,17 @@
             "asyncRewake": true
           }
         ]
+      },
+      {
+        "matcher": "authentication_failed",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/trocar-conta.js\" trocar --hook",
+            "timeout": 21000,
+            "asyncRewake": true
+          }
+        ]
       }
     ],
     "Stop": [
